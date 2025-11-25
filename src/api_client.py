@@ -1,31 +1,26 @@
 # src/api_client.py
-
 import os
-import base64  # (not strictly needed with the grant_type flow, but harmless)
-from typing import Any, Dict
-
+import time
 import requests
 from dotenv import load_dotenv
 
-# Load environment variables from .env in project root
 load_dotenv()
 
-WCL_TOKEN_URL = "https://www.warcraftlogs.com/oauth/token"
+WCL_OAUTH_URL = "https://www.warcraftlogs.com/oauth/token"
 WCL_GRAPHQL_URL = "https://www.warcraftlogs.com/api/v2/client"
 
-_token_cache: str | None = None
+_token_cache: dict[str, float | str | None] = {
+    "access_token": None,
+    "expires_at": 0.0,
+}
 
 
 def get_wcl_token() -> str:
     """
-    Request an OAuth2 client-credentials token from Warcraft Logs.
-
-    Uses WCL_CLIENT_ID and WCL_CLIENT_SECRET from the environment.
-    Caches the token in-process so we don't request it on every query.
+    Get (and cache) a Warcraft Logs OAuth2 access token using client credentials.
+    Requires WCL_CLIENT_ID and WCL_CLIENT_SECRET in .env
     """
-    global _token_cache
-    if _token_cache:
-        return _token_cache
+    import time as _time
 
     client_id = os.getenv("WCL_CLIENT_ID")
     client_secret = os.getenv("WCL_CLIENT_SECRET")
@@ -33,23 +28,37 @@ def get_wcl_token() -> str:
     if not client_id or not client_secret:
         raise ValueError("Missing WCL_CLIENT_ID or WCL_CLIENT_SECRET in your .env file.")
 
-    data = {
-        "grant_type": "client_credentials",
-        "client_id": client_id,
-        "client_secret": client_secret,
-    }
+    now = _time.time()
+    cached = _token_cache.get("access_token")
+    exp = _token_cache.get("expires_at", 0.0)
 
-    resp = requests.post(WCL_TOKEN_URL, data=data)
+    if cached and now < exp - 60:
+        return cached  # still valid
+
+    resp = requests.post(
+        WCL_OAUTH_URL,
+        data={"grant_type": "client_credentials"},
+        auth=(client_id, client_secret),
+        timeout=15,
+    )
     resp.raise_for_status()
+    data = resp.json()
 
-    token = resp.json()["access_token"]
-    _token_cache = token
-    return token
+    access_token = data["access_token"]
+    expires_in = float(data.get("expires_in", 3600))
+
+    _token_cache["access_token"] = access_token
+    _token_cache["expires_at"] = now + expires_in
+
+    return access_token
 
 
-def run_wcl_query(query: str, variables: Dict[str, Any] | None = None) -> Dict[str, Any]:
+def run_wcl_query(query: str, variables: dict | None = None) -> dict:
     """
-    Run a GraphQL query against the Warcraft Logs v2 API and return the full JSON.
+    Run a GraphQL query against the Warcraft Logs v2 client API and return
+    the full JSON response (including the top-level 'data' object).
+
+    Raises RuntimeError if the API returns GraphQL errors.
     """
     token = get_wcl_token()
 
@@ -57,22 +66,19 @@ def run_wcl_query(query: str, variables: Dict[str, Any] | None = None) -> Dict[s
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
+    payload = {
+        "query": query,
+        "variables": variables or {},
+    }
 
-    payload: Dict[str, Any] = {"query": query}
-    if variables:
-        payload["variables"] = variables
-
-    response = requests.post(WCL_GRAPHQL_URL, headers=headers, json=payload)
-
-    # Debug print so we can see raw responses while developing
-    # print("WCL RESPONSE:", response.text)
-
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"GraphQL request failed: {response.status_code} - {response.text}"
-        )
-
-    result: Dict[str, Any] = response.json()
+    resp = requests.post(
+        WCL_GRAPHQL_URL,
+        json=payload,
+        headers=headers,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    result = resp.json()
 
     if "errors" in result:
         print("Warcraft Logs API returned errors:")
@@ -80,5 +86,4 @@ def run_wcl_query(query: str, variables: Dict[str, Any] | None = None) -> Dict[s
             print(err)
         raise RuntimeError("Warcraft Logs API error — see messages above.")
 
-    # IMPORTANT: return the full JSON, not just result["data"]
     return result

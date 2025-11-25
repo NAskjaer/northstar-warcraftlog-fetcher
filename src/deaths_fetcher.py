@@ -1,20 +1,21 @@
 # src/deaths_fetcher.py
-
 from __future__ import annotations
 
-from typing import Dict, List, Any, Optional
-from collections import defaultdict
+from typing import Any, Dict, List
 
-from src.api_client import run_wcl_query
+from .api_client import run_wcl_query
 
 
 def get_boss_fights_for_report(
     report_code: str,
     boss_id: int,
-    difficulty: int = 5,
+    difficulty: int | None = 5,
 ) -> List[Dict[str, Any]]:
     """
-    Return all fights for a given boss in a report, filtered by encounterID and difficulty.
+    Fetch all fights for a report, then filter by encounterID (boss) and difficulty.
+
+    Returns a list of ReportFight dicts:
+    { id, name, encounterID, difficulty, kill, startTime, endTime }.
     """
     query = """
     query ($code: String!) {
@@ -23,11 +24,11 @@ def get_boss_fights_for_report(
           fights {
             id
             name
+            encounterID
             difficulty
             kill
             startTime
             endTime
-            encounterID
           }
         }
       }
@@ -38,38 +39,84 @@ def get_boss_fights_for_report(
     result = run_wcl_query(query, variables)
 
     try:
-        all_fights = result["data"]["reportData"]["report"]["fights"]
+        fights = result["data"]["reportData"]["report"]["fights"]
     except KeyError as exc:
         raise RuntimeError(f"Unexpected fights response from WCL: {result}") from exc
 
-    fights = [
-        f
-        for f in all_fights
-        if f.get("encounterID") == boss_id and f.get("difficulty") == difficulty
-    ]
+    # Filter client-side
+    boss_fights: List[Dict[str, Any]] = []
+    for f in fights:
+        if f.get("encounterID") != boss_id:
+            continue
+        if difficulty is not None and f.get("difficulty") != difficulty:
+            continue
+        boss_fights.append(f)
 
     print(
         f"  [deaths_fetcher] Report {report_code}: "
-        f"{len(fights)} fights for boss {boss_id} at difficulty {difficulty}"
+        f"{len(fights)} raw fights, {len(boss_fights)} boss fights"
     )
 
-    return fights
+    return boss_fights
 
 
-def get_actor_name_map(report_code: str) -> Dict[int, str]:
+def _fetch_death_events(
+    report_code: str,
+    start_time: int,
+    end_time: int,
+) -> List[Dict[str, Any]]:
     """
-    Fetch masterData.actors for a report and build an ID -> name map.
-    This lets us turn targetID into player names.
+    Fetch ALL death events in [start_time, end_time] for the report.
+
+    Uses the standard WCL pattern:
+      events(startTime: ..., endTime: ..., dataType: Deaths) { data }
+    """
+    query = """
+    query ($code: String!, $start: Float!, $end: Float!) {
+      reportData {
+        report(code: $code) {
+          events(
+            startTime: $start
+            endTime: $end
+            dataType: Deaths
+          ) {
+            data
+          }
+        }
+      }
+    }
+    """
+
+    variables = {
+        "code": report_code,
+        "start": float(start_time),
+        "end": float(end_time),
+    }
+
+    result = run_wcl_query(query, variables)
+
+    try:
+        events = result["data"]["reportData"]["report"]["events"]["data"]
+    except KeyError as exc:
+        raise RuntimeError(f"Unexpected events response from WCL: {result}") from exc
+
+    return events
+
+
+def _fetch_player_actors(report_code: str) -> Dict[int, str]:
+    """
+    Fetch player actors (id -> name) for this report.
+
+    Uses masterData.actors(type: "Player").
     """
     query = """
     query ($code: String!) {
       reportData {
         report(code: $code) {
           masterData {
-            actors {
+            actors(type: "Player") {
               id
               name
-              type
             }
           }
         }
@@ -89,172 +136,117 @@ def get_actor_name_map(report_code: str) -> Dict[int, str]:
     for actor in actors:
         actor_id = actor.get("id")
         name = actor.get("name")
-        if actor_id is None or not name:
+        if actor_id is None or name is None:
             continue
-        # We could filter on actor["type"] == "Player" if needed,
-        # but usually only players have deaths to this ability.
-        id_to_name[actor_id] = name
+        id_to_name[int(actor_id)] = str(name)
 
-    print(
-        f"  [deaths_fetcher] Report {report_code}: loaded {len(id_to_name)} actors."
-    )
-
+    print(f"  [deaths_fetcher] Report {report_code}: loaded {len(id_to_name)} actors.")
     return id_to_name
-
-
-def _fetch_death_events(
-    report_code: str,
-    start_time: int,
-    end_time: int,
-    fight_ids: List[int],
-) -> List[Dict[str, Any]]:
-    """
-    Fetch all death events for the given fights, handling pagination.
-    """
-    query = """
-    query ($code: String!, $startTime: Float!, $endTime: Float!, $fightIDs: [Int!]) {
-      reportData {
-        report(code: $code) {
-          events(
-            startTime: $startTime
-            endTime: $endTime
-            dataType: Deaths
-            fightIDs: $fightIDs
-          ) {
-            data
-            nextPageTimestamp
-          }
-        }
-      }
-    }
-    """
-
-    all_events: List[Dict[str, Any]] = []
-    page_start = start_time
-
-    while True:
-        variables = {
-            "code": report_code,
-            "startTime": float(page_start),
-            "endTime": float(end_time),
-            "fightIDs": fight_ids,
-        }
-        result = run_wcl_query(query, variables)
-
-        try:
-            events_obj = result["data"]["reportData"]["report"]["events"]
-        except KeyError as exc:
-            raise RuntimeError(f"Unexpected events response from WCL: {result}") from exc
-
-        data = events_obj.get("data", [])
-        all_events.extend(data)
-
-        next_page = events_obj.get("nextPageTimestamp")
-        if not next_page:
-            break
-
-        page_start = next_page
-
-    print(
-        f"  [deaths_fetcher] Report {report_code}: "
-        f"{len(all_events)} total death events for fights {fight_ids}"
-    )
-
-    if all_events:
-        print("    Sample death event:", all_events[0])
-
-    return all_events
 
 
 def get_deaths_by_player_for_ability(
     report_code: str,
     boss_id: int,
-    difficulty: int = 5,
-    ability_id: int | None = None,
+    ability_id: int,
+    difficulty: int | None = 5,
     wipes_only: bool = True,
-    max_deaths_per_pull: int | None = None,  # currently ignored (feature dropped)
 ) -> List[Dict[str, Any]]:
     """
-    For a single report, return a list of players and how many times they
-    died to a specific *killing* ability on a given boss.
+    For a single report, return total deaths BY PLAYER for a given boss + ability.
 
-    Returned format:
-        [
-          {"player": "Player1", "pulls": 10, "total_deaths": 3},
-          ...
-        ]
+    Output format:
+      [
+        { "player": "Name", "total_deaths": 7 },
+        ...
+      ]
 
-    Notes:
-      - `wipes_only=True` => only non-kill pulls are counted.
-      - `max_deaths_per_pull` is currently NOT applied. All deaths to the
-        chosen ability are counted (this is the stable behaviour we had before).
+    - Filters fights by encounterID and difficulty.
+    - If wipes_only is True, only includes non-kill pulls (kill == False).
+    - Filters events to:
+        type == "death"
+        fight in those boss fights
+        abilityGameID == ability_id
     """
-    # 1) Fights for this boss
     fights = get_boss_fights_for_report(report_code, boss_id, difficulty)
+
     if not fights:
         print(f"  [deaths_fetcher] Report {report_code}: no fights for this boss.")
         return []
 
+    # Optionally keep only wipes
     if wipes_only:
-        before = len(fights)
         fights = [f for f in fights if not f.get("kill")]
         print(
             f"  [deaths_fetcher] Report {report_code}: "
-            f"{before} fights -> {len(fights)} wipes after filtering."
+            f"{len(fights)} wipes after filtering."
         )
-
-    if not fights:
-        print(f"  [deaths_fetcher] Report {report_code}: no wipes remaining.")
-        return []
+        if not fights:
+            print(f"  [deaths_fetcher] Report {report_code}: no wipes for this boss.")
+            return []
 
     fight_ids = [f["id"] for f in fights]
     start_time = min(f["startTime"] for f in fights)
     end_time = max(f["endTime"] for f in fights)
 
-    # 2) Fetch death events
-    events = _fetch_death_events(report_code, start_time, end_time, fight_ids)
-    if not events:
-        print(f"  [deaths_fetcher] Report {report_code}: no death events found.")
-        return []
-
-    actor_name_map = get_actor_name_map(report_code)
-
-    counts: Dict[str, int] = {}
-
-    for ev in events:
-        # Filter by killing ability if provided
-        if ability_id is not None:
-            killing_ability = ev.get("killingAbilityGameID")
-            # Some logs use abilityGameID, but for the "Total Deaths by Player"
-            # per ability, killingAbilityGameID is usually what matters.
-            if killing_ability != ability_id:
-                continue
-
-        target_id = ev.get("targetID")
-        if target_id is None:
-            continue
-
-        player_name = actor_name_map.get(target_id)
-        if not player_name:
-            continue
-
-        counts[player_name] = counts.get(player_name, 0) + 1
+    # Fetch all death events in that window
+    death_events = _fetch_death_events(report_code, start_time, end_time)
 
     print(
         f"  [deaths_fetcher] Report {report_code}: "
-        f"{sum(counts.values())} deaths across {len(counts)} players "
+        f"{len(death_events)} raw death events in time window."
+    )
+    if death_events:
+        print(f"    Sample death event: {death_events[0]}")
+
+    # Filter down to:
+    #   - the boss fights we care about
+    #   - the specific ability
+    #   - type == 'death'
+    filtered: List[Dict[str, Any]] = []
+    boss_fight_id_set = set(fight_ids)
+
+    for ev in death_events:
+        if ev.get("type") != "death":
+            continue
+        if ev.get("fight") not in boss_fight_id_set:
+            continue
+        if ev.get("abilityGameID") != ability_id:
+            continue
+        filtered.append(ev)
+
+    print(
+        f"  [deaths_fetcher] Report {report_code}: "
+        f"{len(filtered)} events for ability {ability_id} in boss fights."
+    )
+
+    if not filtered:
+        return []
+
+    # Map actor IDs to player names
+    actors_map = _fetch_player_actors(report_code)
+
+    # Count deaths per player (targetID)
+    deaths_by_player: Dict[str, int] = {}
+
+    for ev in filtered:
+        target_id = ev.get("targetID")
+        if target_id is None:
+            continue
+        name = actors_map.get(int(target_id), f"ID-{target_id}")
+        deaths_by_player[name] = deaths_by_player.get(name, 0) + 1
+
+    print(
+        f"  [deaths_fetcher] Report {report_code}: "
+        f"{sum(deaths_by_player.values())} deaths across {len(deaths_by_player)} players "
         f"for ability {ability_id}."
     )
 
-    if not counts:
-        return []
-
-    pulls = len(fight_ids)
-
+    # Convert to sorted list
     rows: List[Dict[str, Any]] = [
-        {"player": name, "pulls": pulls, "total_deaths": deaths}
-        for name, deaths in counts.items()
+        {"player": name, "total_deaths": count}
+        for name, count in deaths_by_player.items()
     ]
+
     rows.sort(key=lambda r: (-r["total_deaths"], r["player"].lower()))
 
     return rows
