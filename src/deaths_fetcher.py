@@ -17,6 +17,12 @@ def get_boss_fights_for_report(
     Returns a list of ReportFight dicts:
     { id, name, encounterID, difficulty, kill, startTime, endTime }.
     """
+    # DEBUG: what are we about to query for?
+    print(
+        f"  [deaths_fetcher] get_boss_fights_for_report("
+        f"report={report_code}, boss_id={boss_id}, difficulty={difficulty})"
+    )
+
     query = """
     query ($code: String!) {
       reportData {
@@ -54,11 +60,11 @@ def get_boss_fights_for_report(
 
     print(
         f"  [deaths_fetcher] Report {report_code}: "
-        f"{len(fights)} raw fights, {len(boss_fights)} boss fights"
+        f"{len(fights)} raw fights, {len(boss_fights)} boss fights "
+        f"(boss_id={boss_id}, difficulty={difficulty})"
     )
 
     return boss_fights
-
 
 def _fetch_death_events(
     report_code: str,
@@ -102,7 +108,6 @@ def _fetch_death_events(
 
     return events
 
-
 def _fetch_player_actors(report_code: str) -> Dict[int, str]:
     """
     Fetch player actors (id -> name) for this report.
@@ -143,7 +148,6 @@ def _fetch_player_actors(report_code: str) -> Dict[int, str]:
     print(f"  [deaths_fetcher] Report {report_code}: loaded {len(id_to_name)} actors.")
     return id_to_name
 
-
 def get_deaths_by_player_for_ability(
     report_code: str,
     boss_id: int,
@@ -160,15 +164,21 @@ def get_deaths_by_player_for_ability(
       ]
 
     - Filters fights by encounterID and difficulty.
-    - Filters events to:
+    - Builds a time window covering all those fights.
+    - Fetches all death events in that window.
+    - Keeps only:
         type == "death"
-        fight in those boss fights
-        abilityGameID == ability_id
+        fight is one of the boss fights
+        abilityGameID == ability_id OR killingAbilityGameID == ability_id
     """
     fights = get_boss_fights_for_report(report_code, boss_id, difficulty)
 
     if not fights:
-        print(f"  [deaths_fetcher] Report {report_code}: no fights for this boss.")
+        print(
+            f"  [deaths_fetcher] Report {report_code}: "
+            f"no fights for boss_id={boss_id}, ability_id={ability_id}, "
+            f"difficulty={difficulty}"
+        )
         return []
 
     fight_ids = [f["id"] for f in fights]
@@ -180,30 +190,38 @@ def get_deaths_by_player_for_ability(
 
     print(
         f"  [deaths_fetcher] Report {report_code}: "
-        f"{len(death_events)} raw death events in time window."
+        f"{len(death_events)} raw death events in time window "
+        f"(boss_id={boss_id}, ability_id={ability_id})"
     )
     if death_events:
         print(f"    Sample death event: {death_events[0]}")
 
     # Filter down to:
-    #   - the boss fights we care about
-    #   - the specific ability
-    #   - type == 'death'
+    #   - the boss fights
+    #   - optional ability_id match (abilityGameID OR killingAbilityGameID)
     filtered: List[Dict[str, Any]] = []
-    boss_fight_id_set = set(fight_ids)
-
     for ev in death_events:
         if ev.get("type") != "death":
             continue
-        if ev.get("fight") not in boss_fight_id_set:
+
+        fight_id = ev.get("fight")
+        if fight_id not in fight_ids:
             continue
-        if ev.get("abilityGameID") != ability_id:
-            continue
+
+        if ability_id is not None:
+            ability_match = (
+                ev.get("abilityGameID") == ability_id
+                or ev.get("killingAbilityGameID") == ability_id
+            )
+            if not ability_match:
+                continue
+
         filtered.append(ev)
 
     print(
         f"  [deaths_fetcher] Report {report_code}: "
-        f"{len(filtered)} events for ability {ability_id} in boss fights."
+        f"{len(filtered)} events for ability {ability_id} in boss fights "
+        f"(boss_id={boss_id})"
     )
 
     if not filtered:
@@ -214,7 +232,6 @@ def get_deaths_by_player_for_ability(
 
     # Count deaths per player (targetID)
     deaths_by_player: Dict[str, int] = {}
-
     for ev in filtered:
         target_id = ev.get("targetID")
         if target_id is None:
@@ -224,8 +241,8 @@ def get_deaths_by_player_for_ability(
 
     print(
         f"  [deaths_fetcher] Report {report_code}: "
-        f"{sum(deaths_by_player.values())} deaths across {len(deaths_by_player)} players "
-        f"for ability {ability_id}."
+        f"{sum(deaths_by_player.values())} deaths across {len(deaths_by_player)} "
+        f"players for ability {ability_id}."
     )
 
     # Convert to sorted list
@@ -233,7 +250,5 @@ def get_deaths_by_player_for_ability(
         {"player": name, "total_deaths": count}
         for name, count in deaths_by_player.items()
     ]
-
     rows.sort(key=lambda r: (-r["total_deaths"], r["player"].lower()))
-
     return rows
