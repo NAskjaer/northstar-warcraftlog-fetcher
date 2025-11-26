@@ -149,7 +149,6 @@ def get_deaths_by_player_for_ability(
     boss_id: int,
     ability_id: int,
     difficulty: int | None = 5,
-    wipes_only: bool = True,
 ) -> List[Dict[str, Any]]:
     """
     For a single report, return total deaths BY PLAYER for a given boss + ability.
@@ -161,7 +160,6 @@ def get_deaths_by_player_for_ability(
       ]
 
     - Filters fights by encounterID and difficulty.
-    - If wipes_only is True, only includes non-kill pulls (kill == False).
     - Filters events to:
         type == "death"
         fight in those boss fights
@@ -172,17 +170,6 @@ def get_deaths_by_player_for_ability(
     if not fights:
         print(f"  [deaths_fetcher] Report {report_code}: no fights for this boss.")
         return []
-
-    # Optionally keep only wipes
-    if wipes_only:
-        fights = [f for f in fights if not f.get("kill")]
-        print(
-            f"  [deaths_fetcher] Report {report_code}: "
-            f"{len(fights)} wipes after filtering."
-        )
-        if not fights:
-            print(f"  [deaths_fetcher] Report {report_code}: no wipes for this boss.")
-            return []
 
     fight_ids = [f["id"] for f in fights]
     start_time = min(f["startTime"] for f in fights)

@@ -1,3 +1,20 @@
+from __future__ import annotations
+
+def _check_dependencies() -> None:
+    try:
+        import requests  # noqa: F401
+        import dotenv    # noqa: F401
+    except ImportError as exc:
+        missing = str(exc).split("'")[1] if "'" in str(exc) else "a required package"
+        msg = (
+            f"Missing Python package: {missing}\n\n"
+            "Please install dependencies with:\n"
+            "    pip install -r requirements.txt\n"
+        )
+        raise SystemExit(msg) from exc
+
+_check_dependencies()
+
 # main.py
 from __future__ import annotations
 
