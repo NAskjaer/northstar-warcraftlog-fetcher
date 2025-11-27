@@ -141,9 +141,6 @@ def render_input_settings() -> Tuple[str, datetime.date, datetime.date, List[Dic
                 help="Only include logs on or before this date.",
             )
 
-        # ---- Section separator + centered heading ---------------------------
-        # Separator before boss blocks
-
         boss_blocks = st.session_state["boss_blocks"]
 
         # --- helper used by Remove boss button ------------------------------
@@ -155,6 +152,10 @@ def render_input_settings() -> Tuple[str, datetime.date, datetime.date, List[Dic
         # --- Render each boss block ----------------------------------------
         for block in boss_blocks:
             st.markdown("---")
+
+            # Shared label so the select and button line up nicely
+            st.markdown("**Boss**")
+
             cols = st.columns([3, 1])
 
             # ---- Boss select ------------------------------------------------
@@ -166,24 +167,26 @@ def render_input_settings() -> Tuple[str, datetime.date, datetime.date, List[Dic
 
                 boss_index = boss_names.index(current_boss_name)
                 boss_name = st.selectbox(
-                    "Boss",
+                    "",
                     boss_names,
                     index=boss_index,
                     key=f"boss_{block['id']}",
-                    help="Choose the boss to analyze. Only logs containing this boss are processed.",
+                    label_visibility="collapsed",
+                    help=(
+                        "Choose the boss to analyze. "
+                        "Only logs containing this boss are processed."
+                    ),
                 )
 
-            # ---- Remove boss button (vertically aligned) -------------------
+            # ---- Remove boss button (aligned with select) ------------------
             with cols[1]:
-                # Add some vertical space so the button lines up with the middle
-                st.write("")
-                st.write("")
                 if len(st.session_state["boss_blocks"]) > 1:
                     st.button(
                         "Remove boss",
                         key=f"remove_block_{block['id']}",
                         on_click=_remove_boss,
                         args=(block["id"],),
+                        use_container_width=True,
                     )
 
             boss_info = BOSS_OPTIONS[boss_name]
@@ -251,10 +254,10 @@ def render_input_settings() -> Tuple[str, datetime.date, datetime.date, List[Dic
 
         st.button("Add another boss", key="add_boss", on_click=_add_boss)
 
-        # ---- Centered Generate CSV button ----------------------------------
-        spacer_left, center_col, spacer_right = st.columns([1, 2, 1])
-        with center_col:
-            submitted = st.button("Generate CSV", key="generate_csv")
+        left, center, right = st.columns([4, 2, 4])
+        with center:
+           submitted = st.button("Generate CSV", key="generate_csv", use_container_width=True)
+
 
     targets = _build_targets_from_blocks(st.session_state["boss_blocks"])
 

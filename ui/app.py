@@ -1,10 +1,13 @@
 from __future__ import annotations
-
 import os
 import io
-import csv 
+import csv
+import time
 from pathlib import Path
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
 
 import streamlit as st
 import pandas as pd
@@ -78,7 +81,7 @@ except Exception:
     if submitted:
         st.error(
             "Could not parse guild ID from URL. "
-            "Expected something like https://www.warcraftlogs.com/guild/id/260153"
+            "Expected something like https://www.warcraftlogs.com/guild/id/235490"
         )
     # If URL is bad and we have no previous result, nothing to show
     if not st.session_state["analysis_cache"]:
@@ -105,9 +108,12 @@ end_dt = datetime(
 if submitted and guild_id is not None:
     if not targets:
         st.error("Please configure at least one boss to analyze.")
+        st.session_state["analysis_cache"] = None
         st.stop()
 
-    # --- Compute fresh results --------------------------------------
+    overall_start = time.perf_counter()
+
+    # --- Fetch reports for guild/date range -----------------------------
     with st.spinner("Fetching reports from Warcraft Logs…"):
         reports = fetch_logs_for_guild(guild_id, start_dt, end_dt)
 
@@ -116,42 +122,89 @@ if submitted and guild_id is not None:
         st.session_state["analysis_cache"] = None
         st.stop()
 
-    status_area = st.empty()
-    progress_bar = st.progress(0.0)
+    # --- Build list of jobs (report × target) ---------------------------
+    jobs: list[tuple[str, str, int, int, int | None]] = []  # (date_str, code, target_idx, boss_id, ability_id)
 
-    all_players: set[str] = set()
-    # key = (target_index, date_str) -> {code, total_deaths, player_counts}
-    meta_by_target_date: dict[tuple[int, str], dict] = {}
-
-    total_reports = len(reports)
-
-    for idx, report in enumerate(reports, start=1):
+    for report in reports:
         code = report["code"]
         start_ms = report["startTime"]
         date_str = datetime.fromtimestamp(
             start_ms / 1000, tz=timezone.utc
         ).date().isoformat()
 
-        status_area.write(
-            f"Processing report {idx}/{total_reports}: "
-            f"{report.get('title', '')} ({code}, {date_str})"
-        )
-        progress_bar.progress(idx / total_reports)
-
         for target_index, target in enumerate(targets):
-            try:
-                rows = get_deaths_by_player_for_ability(
-                    report_code=code,
-                    boss_id=target["boss_id"],
-                    ability_id=target["ability_id"],
-                    difficulty=DIFFICULTY,
+            jobs.append(
+                (
+                    date_str,
+                    code,
+                    target_index,
+                    target["boss_id"],
+                    target["ability_id"],
                 )
-            except RuntimeError:
-                # Skip this target for this report on API error
-                continue
+            )
 
-            player_counts = {row["player"]: row["total_deaths"] for row in rows}
-            total_deaths = sum(player_counts.values())
+    total_jobs = len(jobs)
+    if total_jobs == 0:
+        st.warning("No report/ability combinations to process.")
+        st.session_state["analysis_cache"] = None
+        st.stop()
+
+    status_area = st.empty()
+    progress_bar = st.progress(0.0)
+
+    meta_by_target_date: dict[tuple[int, str], dict] = {}
+    all_players: set[str] = set()
+
+    def process_job(job: tuple[str, str, int, int, int | None]) -> dict:
+        """Run get_deaths_by_player_for_ability for a single (report, target)."""
+        date_str, code, target_index, boss_id, ability_id = job
+        try:
+            rows = get_deaths_by_player_for_ability(
+                report_code=code,
+                boss_id=boss_id,
+                ability_id=ability_id,
+                difficulty=DIFFICULTY,
+            )
+        except RuntimeError:
+            # API error – treat as no data for this job
+            rows = []
+
+        player_counts = {row["player"]: row["total_deaths"] for row in rows}
+        total_deaths = sum(player_counts.values())
+
+        return {
+            "date_str": date_str,
+            "code": code,
+            "target_index": target_index,
+            "total_deaths": total_deaths,
+            "player_counts": player_counts,
+            "boss_id": boss_id,
+            "ability_id": ability_id,
+        }
+
+    # --- Run jobs in parallel -------------------------------------------
+    max_workers = 8  # tweak if needed
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(process_job, job) for job in jobs]
+
+        for i, future in enumerate(as_completed(futures), start=1):
+            result = future.result()
+
+            date_str = result["date_str"]
+            code = result["code"]
+            target_index = result["target_index"]
+            total_deaths = result["total_deaths"]
+            player_counts = result["player_counts"]
+            boss_id = result["boss_id"]
+            ability_id = result["ability_id"]
+
+            # Update status/progress in the main thread
+            ability_label = "All abilities" if ability_id is None else str(ability_id)
+            status_area.write(
+                f"Processed {i}/{total_jobs} jobs "
+                f"(report={code}, boss_id={boss_id}, ability={ability_label})..."
+            )
+            progress_bar.progress(i / total_jobs)
 
             if total_deaths == 0:
                 continue
@@ -228,12 +281,14 @@ if submitted and guild_id is not None:
         df = pd.DataFrame(rows_for_display, columns=df_columns)
         df.reset_index(drop=True, inplace=True)
 
-        # CSV header with boss / ability label, like the original script
+        # CSV header with boss / ability label, similar to original script
         target = targets[target_index]
         boss_label = target["boss_name"]
         ability_id = target["ability_id"]
         if ability_id is not None:
-            ability_display = f"{ability_id} ({ABILITY_NAMES.get(ability_id, 'Unknown')})"
+            ability_display = (
+                f"{ability_id} ({ABILITY_NAMES.get(ability_id, 'Unknown')})"
+            )
         else:
             ability_display = "All abilities"
 
@@ -253,19 +308,22 @@ if submitted and guild_id is not None:
     num_reports = len({info["code"] for info in meta_by_target_date.values()})
     num_players = len(all_players)
 
-    # Build mapping: boss_id -> list of target_indices (abilities)
-    boss_to_targets = {}
+    # Build mapping boss_id -> list of target indices (for boss summary view)
+    boss_to_targets: dict[int, list[int]] = {}
     for idx, tgt in enumerate(targets):
         boss_to_targets.setdefault(tgt["boss_id"], []).append(idx)
 
+    elapsed = time.perf_counter() - overall_start
+
+    # Cache everything for later interactions (download/search/summary)
     st.session_state["analysis_cache"] = {
         "tables": tables,
         "targets": targets,
         "num_reports": num_reports,
         "num_players": num_players,
         "boss_to_targets": boss_to_targets,
+        "elapsed_seconds": elapsed,
     }
-
 
 else:
     # --- Reuse cached results if available --------------------------
@@ -281,4 +339,12 @@ else:
 # --------------------------------------------------------------------
 # Display results (delegated to sections/results_section.py)
 # --------------------------------------------------------------------
+elapsed = None
+cache = st.session_state.get("analysis_cache")
+if cache and "elapsed_seconds" in cache:
+    elapsed = cache["elapsed_seconds"]
+
+if elapsed is not None:
+    st.caption(f"Analysis time (fetch + tables): {elapsed:.1f} seconds.")
+
 render_results(tables, targets, num_reports, num_players)
