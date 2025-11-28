@@ -86,6 +86,7 @@ def main() -> None:
             ability_id=ability_id,
             difficulty=difficulty,
             wipes_only=wipes_only,
+            ignore_after_player_deaths=None,
         )
 
         # rows: [{ "player": str, "total_deaths": int }, ...]

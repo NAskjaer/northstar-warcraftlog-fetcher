@@ -66,8 +66,10 @@ def render_results(
         )
 
         table = tables[selected_index]
-        df: pd.DataFrame = table["df"]        # type: ignore
-        csv_bytes: bytes = table["csv_bytes"] # type: ignore
+        # Use pretty df_display if available; fall back to raw df
+        base_df: pd.DataFrame = table.get("df_display", table["df"])  # type: ignore
+        csv_bytes: bytes = table["csv_bytes"]  # type: ignore
+
 
         tgt = targets[selected_index]
         boss_name = tgt["boss_name"]
@@ -110,9 +112,12 @@ def render_results(
 
         # Filter
         if search_query:
-            df_display = df[df["Player"].str.contains(search_query, case=False, na=False)]
+            df_display = base_df[
+                base_df["Player"].str.contains(search_query, case=False, na=False)
+            ]
         else:
-            df_display = df
+            df_display = base_df
+
 
         # Widen table
         st.dataframe(df_display, use_container_width=True, height=600)
@@ -151,6 +156,11 @@ def render_results(
 
         # Combine totals from each ability
         for idx in target_indices:
+            # Some ability indices may have produced no table at all
+            # (e.g., boss never pulled in this date range). Skip those safely.
+            if idx not in tables:
+                continue
+
             tgt = targets[idx]
 
             ability_id = tgt["ability_id"]
@@ -166,12 +176,21 @@ def render_results(
             dfs.append(sub)
             ability_cols.append(label)
 
+
+        # If no dataframes survived (no data for any ability), don’t crash.
+        if not dfs:
+            st.warning(
+                "No data found for this boss in the selected date range / abilities."
+            )
+            return
+
         # Merge all ability totals on Player
         from functools import reduce
         summary_df = reduce(
             lambda left, right: pd.merge(left, right, on="Player", how="outer"),
             dfs,
         ).fillna(0)
+
 
         # Add overall total column
         summary_df["Total (all abilities)"] = summary_df[ability_cols].sum(axis=1)

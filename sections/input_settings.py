@@ -102,14 +102,15 @@ def _build_targets_from_blocks(
 
     return targets
 
-def render_input_settings() -> Tuple[str, datetime.date, datetime.date, List[Dict[str, Any]], bool]:
+def render_input_settings() -> Tuple[str, datetime.date, datetime.date, List[Dict[str, Any]], int | None, bool]:
     """Render the '2. Input settings' section and return user choices.
 
     Returns:
         guild_url: The raw guild URL string.
         start_date: Python date object for the start of the range.
         end_date: Python date object for the end of the range.
-        targets: List of targets (boss + ability combos) for analysis.
+        targets: List of dicts with boss_name, boss_id, ability_id (or None).
+        int: Death cutoff after N player deaths (None = disabled).
         submitted: Whether the user clicked "Generate CSV".
     """
     _init_boss_blocks()
@@ -117,11 +118,28 @@ def render_input_settings() -> Tuple[str, datetime.date, datetime.date, List[Dic
     with st.expander("2. Input settings", expanded=True):
         st.markdown("Configure which logs to analyze and how to group deaths.")
 
-        guild_url = st.text_input(
-            "Guild URL",
-            placeholder="https://www.warcraftlogs.com/guild/id/260153",
-            help="Full Warcraft Logs guild URL. The app extracts the guild ID from this.",
-        )
+        col_url, col_ignore = st.columns([2, 1])
+
+        with col_url:
+            guild_url = st.text_input(
+                "Guild URL",
+                placeholder="https://www.warcraftlogs.com/guild/id/260153",
+                help="Full Warcraft Logs guild URL. The app extracts the guild ID from this.",
+            )
+
+        with col_ignore:
+            ignore_after_player_deaths_raw = st.number_input(
+                "Ignore events after player deaths",
+                min_value=0,
+                step=1,
+                value=0,
+                help=(
+                    "Matches Warcraft Logs' 'Ignore Events After Player Deaths' option. "
+                    "If set to N > 0, events after the Nth player death in a pull "
+                    "are ignored. If set to 0, all events are counted."
+                ),
+                key="ignore_after_player_deaths",
+            )
 
         today = datetime.now(timezone.utc).date()
         default_start = today - timedelta(days=7)
@@ -160,15 +178,39 @@ def render_input_settings() -> Tuple[str, datetime.date, datetime.date, List[Dic
 
             # ---- Boss select ------------------------------------------------
             with cols[0]:
-                boss_names = list(BOSS_OPTIONS.keys())
-                current_boss_name = block.get("boss_name")
-                if current_boss_name not in boss_names:
-                    current_boss_name = boss_names[0]
+                all_boss_names = list(BOSS_OPTIONS.keys())
 
-                boss_index = boss_names.index(current_boss_name)
+                # Bosses already chosen in OTHER blocks
+                used_by_others = {
+                    b.get("boss_name")
+                    for b in boss_blocks
+                    if b["id"] != block["id"] and b.get("boss_name") in BOSS_OPTIONS
+                }
+
+                # Current boss for this block (keep it selectable even if used)
+                current_boss_name = block.get("boss_name")
+                if current_boss_name not in all_boss_names:
+                    current_boss_name = all_boss_names[0]
+
+                # Available bosses = all minus “used by others”, but always
+                # include this block's current boss so the dropdown doesn’t break
+                available_boss_names = [
+                    name
+                    for name in all_boss_names
+                    if name not in used_by_others or name == current_boss_name
+                ]
+
+                # Safety: if somehow nothing left, fall back to all bosses
+                if not available_boss_names:
+                    available_boss_names = all_boss_names
+
+                if current_boss_name not in available_boss_names:
+                    current_boss_name = available_boss_names[0]
+
+                boss_index = available_boss_names.index(current_boss_name)
                 boss_name = st.selectbox(
-                    "",
-                    boss_names,
+                    "Boss",
+                    available_boss_names,
                     index=boss_index,
                     key=f"boss_{block['id']}",
                     label_visibility="collapsed",
@@ -177,6 +219,7 @@ def render_input_settings() -> Tuple[str, datetime.date, datetime.date, List[Dic
                         "Only logs containing this boss are processed."
                     ),
                 )
+
 
             # ---- Remove boss button (aligned with select) ------------------
             with cols[1]:
@@ -233,16 +276,25 @@ def render_input_settings() -> Tuple[str, datetime.date, datetime.date, List[Dic
             # Write the latest UI choices back into the block in-place
             block["boss_name"] = boss_name
             block["selected_abilities"] = selected_ids
-
+            
         # ---- Add another boss (single-click, same pattern as before) -------
         def _add_boss() -> None:
             next_id = st.session_state["next_boss_block_id"]
-            boss_names = list(BOSS_OPTIONS.keys())
-            default_boss_name = (
-                "Nexus-King Salhadaar"
-                if "Nexus-King Salhadaar" in BOSS_OPTIONS
-                else boss_names[0]
+            all_boss_names = list(BOSS_OPTIONS.keys())
+
+            # Bosses already used in existing blocks
+            used_bosses = {
+                b.get("boss_name")
+                for b in st.session_state["boss_blocks"]
+                if b.get("boss_name") in BOSS_OPTIONS
+            }
+
+            # Pick the first boss that isn't used yet, or fall back to first
+            default_boss_name = next(
+                (name for name in all_boss_names if name not in used_bosses),
+                all_boss_names[0],
             )
+
             st.session_state["boss_blocks"].append(
                 {
                     "id": next_id,
@@ -252,13 +304,25 @@ def render_input_settings() -> Tuple[str, datetime.date, datetime.date, List[Dic
             )
             st.session_state["next_boss_block_id"] = next_id + 1
 
+
         st.button("Add another boss", key="add_boss", on_click=_add_boss)
 
         left, center, right = st.columns([4, 2, 4])
         with center:
-           submitted = st.button("Generate CSV", key="generate_csv", use_container_width=True)
-
+            submitted = st.button(
+                "Generate CSV",
+                key="generate_csv",
+                use_container_width=True,
+            )
 
     targets = _build_targets_from_blocks(st.session_state["boss_blocks"])
 
-    return guild_url, start_date, end_date, targets, submitted
+    # 0 or empty should behave as "null" – i.e. no cutoff.
+    if ignore_after_player_deaths_raw and ignore_after_player_deaths_raw > 0:
+        ignore_after_player_deaths: int | None = int(ignore_after_player_deaths_raw)
+    else:
+        ignore_after_player_deaths = None
+
+
+    return guild_url, start_date, end_date, targets, ignore_after_player_deaths, submitted
+

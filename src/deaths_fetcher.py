@@ -70,41 +70,78 @@ def _fetch_death_events(
     report_code: str,
     start_time: int,
     end_time: int,
+    fight_ids: list[int],
+    ignore_after_player_deaths: int | None,
 ) -> List[Dict[str, Any]]:
     """
-    Fetch ALL death events in [start_time, end_time] for the report.
+    Fetch death events for the given fights in [start_time, end_time].
 
-    Uses the standard WCL pattern:
-      events(startTime: ..., endTime: ..., dataType: Deaths) { data }
+    This ALWAYS:
+      - uses the Deaths dataType
+      - restricts to the specified fight IDs
+      - paginates over nextPageTimestamp
+      - optionally applies wipeCutoff when ignore_after_player_deaths > 0
     """
     query = """
-    query ($code: String!, $start: Float!, $end: Float!) {
+    query (
+      $code: String!,
+      $start: Float!,
+      $end: Float!,
+      $fightIDs: [Int!],
+      $wipeCutoff: Int
+    ) {
       reportData {
         report(code: $code) {
           events(
             startTime: $start
             endTime: $end
             dataType: Deaths
+            fightIDs: $fightIDs
+            wipeCutoff: $wipeCutoff
           ) {
             data
+            nextPageTimestamp
           }
         }
       }
     }
     """
 
-    variables = {
-        "code": report_code,
-        "start": float(start_time),
-        "end": float(end_time),
-    }
+    cutoff = (
+        int(ignore_after_player_deaths)
+        if ignore_after_player_deaths and ignore_after_player_deaths > 0
+        else None
+    )
 
-    result = run_wcl_query(query, variables)
+    events: list[dict[str, Any]] = []
+    next_start = float(start_time)
 
-    try:
-        events = result["data"]["reportData"]["report"]["events"]["data"]
-    except KeyError as exc:
-        raise RuntimeError(f"Unexpected events response from WCL: {result}") from exc
+    while True:
+        variables = {
+            "code": report_code,
+            "start": next_start,
+            "end": float(end_time),
+            "fightIDs": fight_ids,
+            "wipeCutoff": cutoff,
+        }
+
+        result = run_wcl_query(query, variables)
+
+        try:
+            node = result["data"]["reportData"]["report"]["events"]
+        except KeyError as exc:
+            raise RuntimeError(
+                f"Unexpected events response from WCL: {result}"
+            ) from exc
+
+        events.extend(node.get("data", []))
+
+        next_ts = node.get("nextPageTimestamp")
+        if not next_ts:
+            break
+
+        # Use nextPageTimestamp as the next startTime
+        next_start = float(next_ts)
 
     return events
 
@@ -153,7 +190,10 @@ def get_deaths_by_player_for_ability(
     boss_id: int,
     ability_id: int,
     difficulty: int | None = 5,
+    ignore_after_player_deaths: int | None = None,
 ) -> List[Dict[str, Any]]:
+
+
     """
     For a single report, return total deaths BY PLAYER for a given boss + ability.
 
@@ -176,8 +216,7 @@ def get_deaths_by_player_for_ability(
     if not fights:
         print(
             f"  [deaths_fetcher] Report {report_code}: "
-            f"no fights for boss_id={boss_id}, ability_id={ability_id}, "
-            f"difficulty={difficulty}"
+            f"no fights found for boss {boss_id} (difficulty={difficulty})."
         )
         return []
 
@@ -185,8 +224,14 @@ def get_deaths_by_player_for_ability(
     start_time = min(f["startTime"] for f in fights)
     end_time = max(f["endTime"] for f in fights)
 
-    # Fetch all death events in that window
-    death_events = _fetch_death_events(report_code, start_time, end_time)
+    # Fetch death events for these fights, with optional wipeCutoff
+    death_events = _fetch_death_events(
+        report_code=report_code,
+        start_time=start_time,
+        end_time=end_time,
+        fight_ids=fight_ids,
+        ignore_after_player_deaths=ignore_after_player_deaths,
+    )
 
     print(
         f"  [deaths_fetcher] Report {report_code}: "
@@ -195,6 +240,7 @@ def get_deaths_by_player_for_ability(
     )
     if death_events:
         print(f"    Sample death event: {death_events[0]}")
+
 
     # Filter down to:
     #   - the boss fights

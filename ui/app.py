@@ -14,7 +14,8 @@ import pandas as pd
 from dotenv import load_dotenv
 
 from src.calendar_fetcher import fetch_logs_for_guild
-from src.deaths_fetcher import get_deaths_by_player_for_ability
+from src.deaths_fetcher import (get_deaths_by_player_for_ability, get_boss_fights_for_report)
+
 
 from sections.env_section import render_env_section
 from sections.input_settings import (
@@ -70,7 +71,9 @@ if not env_ok:
 # ====================================================================
 # 2. Input settings section (delegated to sections/input_settings.py)
 # ====================================================================
-guild_url, start_date, end_date, targets, submitted = render_input_settings()
+guild_url, start_date, end_date, targets, ignore_after_player_deaths, submitted = (
+    render_input_settings()
+)
 
 # Parse guild id (only once; error out if bad)
 try:
@@ -123,15 +126,31 @@ if submitted and guild_id is not None:
         st.stop()
 
     # --- Build list of jobs (report × target) ---------------------------
-    jobs: list[tuple[str, str, int, int, int | None]] = []  # (date_str, code, target_idx, boss_id, ability_id)
-
+    # 1) Group reports by calendar date (based on report start time).
+    reports_by_date: dict[str, list[dict]] = {}
     for report in reports:
-        code = report["code"]
         start_ms = report["startTime"]
         date_str = datetime.fromtimestamp(
             start_ms / 1000, tz=timezone.utc
-        ).date().isoformat()
+        ).strftime("%Y-%m-%d")
+        reports_by_date.setdefault(date_str, []).append(report)
 
+    # 2) For each date, choose the report with the longest duration.
+    best_reports_per_date: list[tuple[str, dict]] = []
+    for date_str, reps in reports_by_date.items():
+        def _duration(r: dict) -> int:
+            start_ms = r.get("startTime", 0)
+            end_ms = r.get("endTime", start_ms)
+            return end_ms - start_ms
+
+        best_report = max(reps, key=_duration)
+        best_reports_per_date.append((date_str, best_report))
+
+    # 3) Build jobs only for the chosen report for that date.
+    jobs: list[tuple[str, str, int, int, int | None]] = []  # (date_str, code, target_idx, boss_id, ability_id)
+
+    for date_str, report in best_reports_per_date:
+        code = report["code"]
         for target_index, target in enumerate(targets):
             jobs.append(
                 (
@@ -142,6 +161,7 @@ if submitted and guild_id is not None:
                     target["ability_id"],
                 )
             )
+
 
     total_jobs = len(jobs)
     if total_jobs == 0:
@@ -164,10 +184,22 @@ if submitted and guild_id is not None:
                 boss_id=boss_id,
                 ability_id=ability_id,
                 difficulty=DIFFICULTY,
+                ignore_after_player_deaths=ignore_after_player_deaths,
             )
         except RuntimeError:
             # API error – treat as no data for this job
             rows = []
+
+        # Count pulls for this boss in this report
+        try:
+            fights = get_boss_fights_for_report(
+                report_code=code,
+                boss_id=boss_id,
+                difficulty=DIFFICULTY,
+            )
+            num_pulls = len(fights)
+        except RuntimeError:
+            num_pulls = 0
 
         player_counts = {row["player"]: row["total_deaths"] for row in rows}
         total_deaths = sum(player_counts.values())
@@ -180,7 +212,9 @@ if submitted and guild_id is not None:
             "player_counts": player_counts,
             "boss_id": boss_id,
             "ability_id": ability_id,
+            "num_pulls": num_pulls,
         }
+
 
     # --- Run jobs in parallel -------------------------------------------
     max_workers = 8  # tweak if needed
@@ -197,6 +231,7 @@ if submitted and guild_id is not None:
             player_counts = result["player_counts"]
             boss_id = result["boss_id"]
             ability_id = result["ability_id"]
+            num_pulls = result["num_pulls"]
 
             # Update status/progress in the main thread
             ability_label = "All abilities" if ability_id is None else str(ability_id)
@@ -206,7 +241,7 @@ if submitted and guild_id is not None:
             )
             progress_bar.progress(i / total_jobs)
 
-            if total_deaths == 0:
+            if num_pulls == 0:
                 continue
 
             key = (target_index, date_str)
@@ -216,6 +251,7 @@ if submitted and guild_id is not None:
                     "code": code,
                     "total_deaths": total_deaths,
                     "player_counts": player_counts,
+                    "num_pulls": num_pulls,
                 }
                 all_players.update(player_counts.keys())
 
@@ -233,10 +269,15 @@ if submitted and guild_id is not None:
     # Build one matrix-style table per target (boss + ability)
     # ----------------------------------------------------------------
     # Group meta rows per target_index
-    per_target_entries: dict[int, list[tuple[str, str, dict[str, int]]]] = {}
+    per_target_entries: dict[int, list[tuple[str, str, dict[str, int], int]]] = {}
     for (target_index, date_str), info in meta_by_target_date.items():
         per_target_entries.setdefault(target_index, []).append(
-            (date_str, info["code"], info["player_counts"])
+            (
+                date_str,
+                info["code"],
+                info["player_counts"],
+                info.get("num_pulls", 0),
+            )
         )
 
     tables: dict[int, dict[str, object]] = {}
@@ -244,16 +285,39 @@ if submitted and guild_id is not None:
     for target_index, entries in per_target_entries.items():
         # Sort days for this target
         entries.sort(key=lambda tup: tup[0])  # sort by date_str
-        date_columns = [date for (date, _code, _counts) in entries]
-        report_codes = [code for (_date, code, _counts) in entries]
+
+        # Raw ISO date strings and pulls per date
+        date_columns = [date for (date, _code, _counts, _pulls) in entries]
+        pulls_per_date = {date: pulls for (date, _code, _counts, pulls) in entries}
+        total_pulls = sum(pulls_per_date.values())
+
+        # Build nice DD/MM labels with pulls
+        friendly_date_labels: list[str] = []
+        for date in date_columns:
+            dt = datetime.strptime(date, "%Y-%m-%d").date()
+            base = dt.strftime("%d/%m")
+            pulls = pulls_per_date.get(date, 0)
+            if pulls > 0:
+                label = f"{base} ({pulls} pulls)"
+            else:
+                label = base
+            friendly_date_labels.append(label)
+
+        # Label for the total column
+        total_col_label = "Total Deaths"
+        if total_pulls > 0:
+            total_col_label = f"{total_col_label} ({total_pulls} pulls)"
+
+        report_codes = [code for (_date, code, _counts, _pulls) in entries]
 
         # Build per-report player counts and total player set
         per_report_counts: dict[str, dict[str, int]] = {}
         players_for_target: set[str] = set()
 
-        for date_str, code, player_counts in entries:
+        for date_str, code, player_counts, _pulls in entries:
             per_report_counts[code] = player_counts
             players_for_target.update(player_counts.keys())
+
 
         # Totals per player across all days for this target
         player_totals: dict[str, int] = {}
@@ -268,20 +332,29 @@ if submitted and guild_id is not None:
             key=lambda p: (-player_totals[p], p.lower()),
         )
 
-        df_columns = ["Player", "Total Deaths"] + date_columns
+        # Internal column names (raw, used for boss summary)
+        df_columns_internal = ["Player", "Total Deaths"] + date_columns
 
         rows_for_display: list[list[object]] = []
         for player in sorted_players:
             row = [player, player_totals[player]]
-            for _date, code, _counts in entries:
+            for _date, code, _counts, _pulls in entries:
                 deaths = per_report_counts.get(code, {}).get(player, 0)
                 row.append(deaths)
             rows_for_display.append(row)
 
-        df = pd.DataFrame(rows_for_display, columns=df_columns)
+        # DataFrame with raw column names
+        df = pd.DataFrame(rows_for_display, columns=df_columns_internal)
         df.reset_index(drop=True, inplace=True)
 
-        # CSV header with boss / ability label, similar to original script
+        # DataFrame for display / CSV with pretty labels
+        df_display = df.copy()
+        rename_map = {"Total Deaths": total_col_label}
+        rename_map.update(dict(zip(date_columns, friendly_date_labels)))
+        df_display = df_display.rename(columns=rename_map)
+
+
+        # CSV header with boss / ability label
         target = targets[target_index]
         boss_label = target["boss_name"]
         ability_id = target["ability_id"]
@@ -295,15 +368,17 @@ if submitted and guild_id is not None:
         csv_buffer = io.StringIO()
         writer = csv.writer(csv_buffer)
         writer.writerow([boss_label, ability_display])
-        writer.writerow(df_columns)
-        for r in rows_for_display:
+        writer.writerow(df_display.columns.tolist())
+        for r in df_display.itertuples(index=False, name=None):
             writer.writerow(r)
         csv_bytes = csv_buffer.getvalue().encode("utf-8")
 
         tables[target_index] = {
-            "df": df,
+            "df": df,               # raw (used for boss summary)
+            "df_display": df_display,  # pretty (for single-ability view)
             "csv_bytes": csv_bytes,
         }
+
 
     num_reports = len({info["code"] for info in meta_by_target_date.values()})
     num_players = len(all_players)
