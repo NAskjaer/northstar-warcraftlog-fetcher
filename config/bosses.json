@@ -1,14 +1,14 @@
 {
   "bosses": {
     "Plexus Sentinel": {
-      "id": 3122,
+      "id": 3129,
       "abilities": [
         1219346,
         1219223
       ]
     },
     "Loom'ithar": {
-      "id": 3123,
+      "id": 3131,
       "abilities": [
         1226877,
         1226366,
@@ -16,7 +16,7 @@
       ]
     },
     "Soulbinder Naazindhri": {
-      "id": 3129,
+      "id": 3130,
       "abilities": []
     },
     "Forgeweaver Araz": {
@@ -27,14 +27,14 @@
       ]
     },
     "The Soul Hunters": {
-      "id": 3133,
+      "id": 3122,
       "abilities": [
         1247495,
         1227846
       ]
     },
     "Fractillus": {
-      "id": 3135,
+      "id": 3133,
       "abilities": [
         1230163,
         1247424
@@ -50,7 +50,7 @@
       ]
     },
     "Dimensius, the All-Devouring": {
-      "id": 3141,
+      "id": 3135,
       "abilities": [
         1249077,
         1234251

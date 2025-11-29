@@ -92,7 +92,7 @@ def render_input_settings() -> Tuple[
         with col_url:
             guild_url = st.text_input(
                 "Guild URL",
-                placeholder="https://www.warcraftlogs.com/guild/id/260153",
+                placeholder="https://www.warcraftlogs.com/guild/id/235490",
                 help="Full Warcraft Logs guild URL. The app extracts the guild ID from this.",
             )
 
