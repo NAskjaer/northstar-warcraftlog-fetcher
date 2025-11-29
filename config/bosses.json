@@ -1,0 +1,79 @@
+{
+  "bosses": {
+    "Plexus Sentinel": {
+      "id": 3122,
+      "abilities": [
+        1219346,
+        1219223
+      ]
+    },
+    "Loom'ithar": {
+      "id": 3123,
+      "abilities": [
+        1226877,
+        1226366,
+        1237307
+      ]
+    },
+    "Soulbinder Naazindhri": {
+      "id": 3129,
+      "abilities": []
+    },
+    "Forgeweaver Araz": {
+      "id": 3132,
+      "abilities": [
+        1228168,
+        1237322
+      ]
+    },
+    "The Soul Hunters": {
+      "id": 3133,
+      "abilities": [
+        1247495,
+        1227846
+      ]
+    },
+    "Fractillus": {
+      "id": 3135,
+      "abilities": [
+        1230163,
+        1247424
+      ]
+    },
+    "Nexus-King Salhadaar": {
+      "id": 3134,
+      "abilities": [
+        1227472,
+        1224794,
+        1225331,
+        1224840
+      ]
+    },
+    "Dimensius, the All-Devouring": {
+      "id": 3141,
+      "abilities": [
+        1249077,
+        1234251
+      ]
+    }
+  },
+  "ability_names": {
+    "1219346": "Obliteration Arcanocannon / Tank mechanic",
+    "1219223": "Atomize / Wall mechanic",
+    "1226877": "Primal Spellstorm",
+    "1226366": "Living Silk",
+    "1237307": "Lair Weaving",
+    "1228168": "Silencing Tempest",
+    "1237322": "Prime Sequence",
+    "1247495": "Null Explosion",
+    "1227846": "Soul Hunt / Soaking",
+    "1230163": "Fracture",
+    "1247424": "Null Consumption",
+    "1227472": "Besiege",
+    "1224794": "Conquer",
+    "1225331": "Galactic Smash",
+    "1224840": "Behead",
+    "1249077": "Oblivion",
+    "1234251": "Crushed"
+  }
+}

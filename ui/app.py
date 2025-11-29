@@ -7,8 +7,6 @@ from pathlib import Path
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-
-
 import streamlit as st
 import pandas as pd
 from dotenv import load_dotenv

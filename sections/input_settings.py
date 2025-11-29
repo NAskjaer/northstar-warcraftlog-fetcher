@@ -1,50 +1,15 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date as date_cls
 from typing import List, Dict, Any, Tuple
 
 import streamlit as st
 
+from src import boss_config
 
-# --- ABILITY NAME LOOKUP ------------------------------------------------------
-ABILITY_NAMES: Dict[int, str] = {
-    # Plexus Sentinel
-    1219346: "Obliteration Arcanocannon / Tank mechanic",
-    1219223: "Atomize / Wall mechanic",
-    # Loom'ithar
-    1226877: "Primal Spellstorm",
-    1226366: "Living Silk",
-    1237307: "Lair Weaving",
-    # Forgeweaver Araz
-    1228168: "Silencing Tempest",
-    1237322: "Prime Sequence",
-    # The Soul Hunters
-    1247495: "Null Explosion",
-    1227846: "Soul Hunt / Soaking",
-    # Fractillus
-    1230163: "Fracture",
-    1247424: "Null Consumption",
-    # Nexus-King Salhadaar
-    1227472: "Besiege",
-    1224794: "Conquer",
-    1225331: "Galactic Smash",
-    1224840: "Behead",
-}
-
-# --- BOSS LIST ------------------------------------------------------
-BOSS_OPTIONS: Dict[str, Dict[str, Any]] = {
-    "Plexus Sentinel": {"id": 3122, "abilities": [1219346, 1219223]},
-    "Loom'ithar": {"id": 3123, "abilities": [1226877, 1226366, 1237307]},
-    "Soulbinder Naazindhri": {"id": 3129, "abilities": []},
-    "Forgeweaver Araz": {"id": 3132, "abilities": [1228168, 1237322]},
-    "The Soul Hunters": {"id": 3133, "abilities": [1247495, 1227846]},
-    "Fractillus": {"id": 3135, "abilities": [1230163, 1247424]},
-    "Nexus-King Salhadaar": {
-        "id": 3134,
-        "abilities": [1227472, 1224794, 1225331, 1224840],
-    },
-    "Dimensius, the All-Devouring": {"id": 3141, "abilities": []},
-}
+# Load boss / ability configuration from JSON
+ABILITY_NAMES: Dict[int, str] = boss_config.get_ability_names()
+BOSS_OPTIONS: Dict[str, Dict[str, Any]] = boss_config.get_boss_options()
 
 DIFFICULTY: int = 5  # always Mythic
 
@@ -53,15 +18,15 @@ def _init_boss_blocks() -> None:
     """Initialise the boss_blocks structure in session_state if needed."""
     if "boss_blocks" not in st.session_state:
         boss_names = list(BOSS_OPTIONS.keys())
-        default_boss_name = (
-            "Nexus-King Salhadaar"
-            if "Nexus-King Salhadaar" in BOSS_OPTIONS
-            else boss_names[0]
-        )
+        if not boss_names:
+            st.session_state["boss_blocks"] = []
+            st.session_state["next_boss_block_id"] = 0
+            return
+
         st.session_state["boss_blocks"] = [
             {
                 "id": 0,
-                "boss_name": default_boss_name,
+                "boss_name": boss_names[0],
                 "selected_abilities": [],
             }
         ]
@@ -69,17 +34,18 @@ def _init_boss_blocks() -> None:
 
 
 def _build_targets_from_blocks(
-    boss_blocks: List[Dict[str, Any]],
+    boss_blocks: List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
-    """Convert boss_blocks into a flat list of targets for analysis.
-
-    Each target is a dict with: boss_name, boss_id, ability_id (or None for all).
-    """
+    """Build the list of (boss, ability) targets from the UI blocks."""
     targets: List[Dict[str, Any]] = []
+
     for block in boss_blocks:
-        boss_name = block["boss_name"]
+        boss_name = block.get("boss_name")
+        if not boss_name or boss_name not in BOSS_OPTIONS:
+            continue
+
         boss_info = BOSS_OPTIONS[boss_name]
-        selected_abilities = block.get("selected_abilities", [])
+        selected_abilities = block.get("selected_abilities") or []
 
         if selected_abilities:
             for ability_id in selected_abilities:
@@ -102,22 +68,25 @@ def _build_targets_from_blocks(
 
     return targets
 
-def render_input_settings() -> Tuple[str, datetime.date, datetime.date, List[Dict[str, Any]], int | None, bool]:
-    """Render the '2. Input settings' section and return user choices.
 
-    Returns:
-        guild_url: The raw guild URL string.
-        start_date: Python date object for the start of the range.
-        end_date: Python date object for the end of the range.
-        targets: List of dicts with boss_name, boss_id, ability_id (or None).
-        int: Death cutoff after N player deaths (None = disabled).
-        submitted: Whether the user clicked "Generate CSV".
-    """
+def render_input_settings() -> Tuple[
+    str,
+    date_cls,
+    date_cls,
+    List[Dict[str, Any]],
+    int | None,
+    bool,
+]:
+    """Render the '2. Input settings' section and return user choices."""
+
     _init_boss_blocks()
 
     with st.expander("2. Input settings", expanded=True):
         st.markdown("Configure which logs to analyze and how to group deaths.")
 
+        # ------------------------------------------------------------------
+        # Guild URL + ignore-after-deaths
+        # ------------------------------------------------------------------
         col_url, col_ignore = st.columns([2, 1])
 
         with col_url:
@@ -141,6 +110,9 @@ def render_input_settings() -> Tuple[str, datetime.date, datetime.date, List[Dic
                 key="ignore_after_player_deaths",
             )
 
+        # ------------------------------------------------------------------
+        # Date range
+        # ------------------------------------------------------------------
         today = datetime.now(timezone.utc).date()
         default_start = today - timedelta(days=7)
         default_end = today
@@ -159,50 +131,43 @@ def render_input_settings() -> Tuple[str, datetime.date, datetime.date, List[Dic
                 help="Only include logs on or before this date.",
             )
 
-        boss_blocks = st.session_state["boss_blocks"]
+        # ------------------------------------------------------------------
+        # Boss blocks
+        # ------------------------------------------------------------------
+        boss_blocks = st.session_state.get("boss_blocks", [])
 
-        # --- helper used by Remove boss button ------------------------------
         def _remove_boss(block_id: int) -> None:
             st.session_state["boss_blocks"] = [
                 b for b in st.session_state["boss_blocks"] if b["id"] != block_id
             ]
 
-        # --- Render each boss block ----------------------------------------
         for block in boss_blocks:
             st.markdown("---")
 
-            # Shared label so the select and button line up nicely
             st.markdown("**Boss**")
-
             cols = st.columns([3, 1])
 
-            # ---- Boss select ------------------------------------------------
             with cols[0]:
                 all_boss_names = list(BOSS_OPTIONS.keys())
+                if not all_boss_names:
+                    st.error("No bosses configured in bosses.json.")
+                    continue
 
-                # Bosses already chosen in OTHER blocks
                 used_by_others = {
                     b.get("boss_name")
                     for b in boss_blocks
                     if b["id"] != block["id"] and b.get("boss_name") in BOSS_OPTIONS
                 }
 
-                # Current boss for this block (keep it selectable even if used)
                 current_boss_name = block.get("boss_name")
                 if current_boss_name not in all_boss_names:
                     current_boss_name = all_boss_names[0]
 
-                # Available bosses = all minus “used by others”, but always
-                # include this block's current boss so the dropdown doesn’t break
                 available_boss_names = [
                     name
                     for name in all_boss_names
                     if name not in used_by_others or name == current_boss_name
-                ]
-
-                # Safety: if somehow nothing left, fall back to all bosses
-                if not available_boss_names:
-                    available_boss_names = all_boss_names
+                ] or all_boss_names
 
                 if current_boss_name not in available_boss_names:
                     current_boss_name = available_boss_names[0]
@@ -214,16 +179,10 @@ def render_input_settings() -> Tuple[str, datetime.date, datetime.date, List[Dic
                     index=boss_index,
                     key=f"boss_{block['id']}",
                     label_visibility="collapsed",
-                    help=(
-                        "Choose the boss to analyze. "
-                        "Only logs containing this boss are processed."
-                    ),
                 )
 
-
-            # ---- Remove boss button (aligned with select) ------------------
             with cols[1]:
-                if len(st.session_state["boss_blocks"]) > 1:
+                if len(boss_blocks) > 1:
                     st.button(
                         "Remove boss",
                         key=f"remove_block_{block['id']}",
@@ -235,14 +194,22 @@ def render_input_settings() -> Tuple[str, datetime.date, datetime.date, List[Dic
             boss_info = BOSS_OPTIONS[boss_name]
             boss_ability_ids = boss_info["abilities"]
 
-            # Valid previously selected abilities for this boss
+            # If this boss has zero abilities, show a message and skip multiselect
+            if not boss_ability_ids:
+                st.info(
+                    f"There are currently no abilities configured for **{boss_name}**.\n\n"
+                    "You can add them using **Add / edit abilities** below."
+                )
+                block["boss_name"] = boss_name
+                block["selected_abilities"] = []
+                continue
+
             prev_selected_ids = [
                 ability_id
                 for ability_id in block.get("selected_abilities", [])
                 if ability_id in boss_ability_ids
             ]
 
-            # Multiselect options and defaults (labels include ID + name)
             ability_options = [
                 f"{ability_id} ({ABILITY_NAMES.get(ability_id, 'Unknown')})"
                 for ability_id in boss_ability_ids
@@ -252,19 +219,33 @@ def render_input_settings() -> Tuple[str, datetime.date, datetime.date, List[Dic
                 for ability_id in prev_selected_ids
             ]
 
+            state_key = f"abilities_{block['id']}"
+
+            # If the widget has stale state that doesn't match any option, drop it.
+            # IMPORTANT: we never assign to st.session_state[state_key] here,
+            # we only pop it to avoid the Streamlit warning.
+            if state_key in st.session_state:
+                current_val = st.session_state[state_key]
+                if isinstance(current_val, (list, tuple)):
+                    if not any(v in ability_options for v in current_val):
+                        st.session_state.pop(state_key, None)
+                else:
+                    st.session_state.pop(state_key, None)
+
             selected_labels = st.multiselect(
                 "Abilities to track (leave empty for all abilities)",
                 ability_options,
                 default=default_labels,
-                key=f"abilities_{block['id']}",
+                key=state_key,
                 help=(
                     "Choose one or more abilities for this boss. "
                     "If none are selected, all deaths for this boss are counted."
                 ),
             )
 
-            # Convert selected labels back to numeric IDs
-            selected_ids: list[int] = []
+
+            # Convert labels back to numeric IDs
+            selected_ids: List[int] = []
             for label in selected_labels:
                 try:
                     ability_id = int(label.split(" ", 1)[0])
@@ -273,23 +254,32 @@ def render_input_settings() -> Tuple[str, datetime.date, datetime.date, List[Dic
                 if ability_id in boss_ability_ids:
                     selected_ids.append(ability_id)
 
-            # Write the latest UI choices back into the block in-place
             block["boss_name"] = boss_name
             block["selected_abilities"] = selected_ids
-            
-        # ---- Add another boss (single-click, same pattern as before) -------
-        def _add_boss() -> None:
-            next_id = st.session_state["next_boss_block_id"]
-            all_boss_names = list(BOSS_OPTIONS.keys())
 
-            # Bosses already used in existing blocks
+        # ------------------------------------------------------------------
+        # Controls: add boss + toggle add-ability form
+        # ------------------------------------------------------------------
+        def _add_boss() -> None:
+            if "next_boss_block_id" not in st.session_state:
+                existing_ids = [
+                    b.get("id", 0) for b in st.session_state.get("boss_blocks", [])
+                ]
+                next_id = max(existing_ids, default=-1) + 1
+                st.session_state["next_boss_block_id"] = next_id
+            else:
+                next_id = st.session_state["next_boss_block_id"]
+
+            all_boss_names = list(BOSS_OPTIONS.keys())
+            if not all_boss_names:
+                return
+
             used_bosses = {
                 b.get("boss_name")
                 for b in st.session_state["boss_blocks"]
                 if b.get("boss_name") in BOSS_OPTIONS
             }
 
-            # Pick the first boss that isn't used yet, or fall back to first
             default_boss_name = next(
                 (name for name in all_boss_names if name not in used_bosses),
                 all_boss_names[0],
@@ -304,9 +294,110 @@ def render_input_settings() -> Tuple[str, datetime.date, datetime.date, List[Dic
             )
             st.session_state["next_boss_block_id"] = next_id + 1
 
+        controls_left, controls_right = st.columns([1, 1])
+        with controls_left:
+            st.button(
+                "Add another boss",
+                key="add_boss",
+                on_click=_add_boss,
+                use_container_width=True,
+            )
 
-        st.button("Add another boss", key="add_boss", on_click=_add_boss)
+        with controls_right:
+            if st.button(
+                "Add Ability",
+                key="toggle_add_ability",
+                use_container_width=True,
+            ):
+                st.session_state["show_add_ability_form"] = not st.session_state.get(
+                    "show_add_ability_form", False
+                )
 
+        # ------------------------------------------------------------------
+        # Inline "Add ability to boss configuration" form
+        # ------------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Inline "Add ability to boss configuration" form
+        # ------------------------------------------------------------------
+        if st.session_state.get("show_add_ability_form", False):
+            st.markdown("---")
+            st.markdown("### Add ability to boss configuration")
+
+            boss_names = list(BOSS_OPTIONS.keys())
+            if boss_names:
+                selected_boss_for_new = st.selectbox(
+                    "Boss",
+                    boss_names,
+                    key="add_ability_boss",
+                )
+                boss_info = BOSS_OPTIONS[selected_boss_for_new]
+
+                ability_id_str = st.text_input(
+                    "Ability ID (numeric, from Warcraft Logs)",
+                    key="add_ability_id",
+                )
+
+                custom_label = st.text_input(
+                    "Label (optional, defaults to WarcraftLogs Ability name if left blank)",
+                    key="add_ability_label",
+                )
+
+                if st.button("Save ability", key="save_new_ability"):
+                    ability_id_str = ability_id_str.strip()
+                    if not ability_id_str:
+                        st.error("Ability ID is required.")
+                    else:
+                        try:
+                            ability_id = int(ability_id_str)
+                        except ValueError:
+                            st.error("Ability ID must be a number.")
+                        else:
+                            # 🔍 Always validate the ID against Warcraft Logs
+                            api_name = boss_config.lookup_ability_name(ability_id)
+                            if api_name is None:
+                                st.error(
+                                    f"Ability ID {ability_id} does not exist on Warcraft Logs."
+                                )
+                            else:
+                                # Use custom label if given, otherwise WCL name
+                                label = custom_label.strip() or api_name
+
+                                # Persist to bosses.json
+                                boss_config.add_ability(
+                                    boss_name=selected_boss_for_new,
+                                    boss_id=boss_info["id"],
+                                    ability_id=ability_id,
+                                    label=label,
+                                )
+
+                                # Update in-memory structures so it works immediately
+                                ABILITY_NAMES[ability_id] = label
+                                if (
+                                    ability_id
+                                    not in BOSS_OPTIONS[selected_boss_for_new]["abilities"]
+                                ):
+                                    BOSS_OPTIONS[selected_boss_for_new][
+                                        "abilities"
+                                    ].append(ability_id)
+
+                                # Clear any stale ability selections so UI refreshes cleanly
+                                for k in list(st.session_state.keys()):
+                                    if str(k).startswith("abilities_"):
+                                        st.session_state.pop(k)
+
+                                # Hide form and rerun to refresh boss block UI
+                                st.session_state["show_add_ability_form"] = False
+                                try:
+                                    st.rerun()
+                                except AttributeError:
+                                    st.experimental_rerun()
+            else:
+                st.warning("No bosses configured in bosses.json; cannot add abilities.")
+
+
+        # ------------------------------------------------------------------
+        # Generate button
+        # ------------------------------------------------------------------
         left, center, right = st.columns([4, 2, 4])
         with center:
             submitted = st.button(
@@ -315,7 +406,7 @@ def render_input_settings() -> Tuple[str, datetime.date, datetime.date, List[Dic
                 use_container_width=True,
             )
 
-    targets = _build_targets_from_blocks(st.session_state["boss_blocks"])
+    targets = _build_targets_from_blocks(st.session_state.get("boss_blocks", []))
 
     # 0 or empty should behave as "null" – i.e. no cutoff.
     if ignore_after_player_deaths_raw and ignore_after_player_deaths_raw > 0:
@@ -323,6 +414,11 @@ def render_input_settings() -> Tuple[str, datetime.date, datetime.date, List[Dic
     else:
         ignore_after_player_deaths = None
 
-
-    return guild_url, start_date, end_date, targets, ignore_after_player_deaths, submitted
-
+    return (
+        guild_url,
+        start_date,
+        end_date,
+        targets,
+        ignore_after_player_deaths,
+        submitted,
+    )
