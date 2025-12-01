@@ -12,7 +12,12 @@ import pandas as pd
 from dotenv import load_dotenv
 
 from src.calendar_fetcher import fetch_logs_for_guild
-from src.deaths_fetcher import (get_deaths_by_player_for_ability, get_boss_fights_for_report)
+from src.deaths_fetcher import (
+    get_deaths_by_player_for_ability,
+    get_boss_fights_for_report,
+)
+from src.damage_taken_fetcher import get_damage_taken_by_player_for_ability
+
 
 
 from sections.env_section import render_env_section
@@ -104,6 +109,19 @@ end_dt = datetime(
 )
 
 # ====================================================================
+# 2.5. Metric selection (Deaths vs Damage Taken)
+# ====================================================================
+metric_mode = st.radio(
+    "What do you want to aggregate?",
+    options=["Deaths", "Damage taken"],
+    index=0,
+    horizontal=True,
+    help="This only changes what the numbers represent. All filters, sorting and CSV export still work the same.",
+)
+metric_is_deaths = metric_mode == "Deaths"
+
+
+# ====================================================================
 # 3. Results section (compute OR reuse cached)
 # ====================================================================
 if submitted and guild_id is not None:
@@ -174,21 +192,55 @@ if submitted and guild_id is not None:
     all_players: set[str] = set()
 
     def process_job(job: tuple[str, str, int, int, int | None]) -> dict:
-        """Run get_deaths_by_player_for_ability for a single (report, target)."""
+        """Run the chosen metric fetcher for a single (report, target)."""
         date_str, code, target_index, boss_id, ability_id = job
+
+        # 1) Fetch per-player data for this (report, boss, ability)
         try:
-            rows = get_deaths_by_player_for_ability(
-                report_code=code,
-                boss_id=boss_id,
-                ability_id=ability_id,
-                difficulty=DIFFICULTY,
-                ignore_after_player_deaths=ignore_after_player_deaths,
-            )
+            if metric_is_deaths:
+                rows = get_deaths_by_player_for_ability(
+                    report_code=code,
+                    boss_id=boss_id,
+                    ability_id=ability_id,
+                    difficulty=DIFFICULTY,
+                    ignore_after_player_deaths=ignore_after_player_deaths,
+                )
+                value_key = "total_deaths"
+            else:
+                rows = get_damage_taken_by_player_for_ability(
+                    report_code=code,
+                    boss_id=boss_id,
+                    ability_id=ability_id,
+                    difficulty=DIFFICULTY,
+                    ignore_after_player_deaths=ignore_after_player_deaths,
+                )
+                value_key = "total_damage"
         except RuntimeError:
             # API error – treat as no data for this job
             rows = []
+            value_key = "total_deaths" if metric_is_deaths else "total_damage"
 
-        # Count pulls for this boss in this report
+        # 2) Build per-player values for this report (main metric)
+        player_counts = {
+            row["player"]: row.get(value_key, 0)
+            for row in rows
+        }
+
+        # In damage mode, also track hits per player.
+        if metric_is_deaths:
+            player_hits: dict[str, int] = {}
+            total_hits = 0
+        else:
+            player_hits = {
+                row["player"]: int(row.get("hits", 0))
+                for row in rows
+            }
+            total_hits = sum(player_hits.values())
+
+        # This is "total metric" (deaths or damage) for compatibility with the rest
+        total_deaths = sum(player_counts.values())
+
+        # 3) Count pulls for this boss in this report
         try:
             fights = get_boss_fights_for_report(
                 report_code=code,
@@ -199,20 +251,18 @@ if submitted and guild_id is not None:
         except RuntimeError:
             num_pulls = 0
 
-        player_counts = {row["player"]: row["total_deaths"] for row in rows}
-        total_deaths = sum(player_counts.values())
-
         return {
             "date_str": date_str,
             "code": code,
             "target_index": target_index,
-            "total_deaths": total_deaths,
-            "player_counts": player_counts,
+            "total_deaths": total_deaths,   # main metric
+            "player_counts": player_counts, # per-player metric
+            "total_hits": total_hits,       # only non-zero in damage mode
+            "player_hits": player_hits,
             "boss_id": boss_id,
             "ability_id": ability_id,
             "num_pulls": num_pulls,
         }
-
 
     # --- Run jobs in parallel -------------------------------------------
     max_workers = 8  # tweak if needed
@@ -222,14 +272,18 @@ if submitted and guild_id is not None:
         for i, future in enumerate(as_completed(futures), start=1):
             result = future.result()
 
-            date_str = result["date_str"]
             code = result["code"]
+            date_str = result["date_str"]
             target_index = result["target_index"]
             total_deaths = result["total_deaths"]
             player_counts = result["player_counts"]
             boss_id = result["boss_id"]
             ability_id = result["ability_id"]
             num_pulls = result["num_pulls"]
+
+            # Damage mode: hits per player / total hits
+            player_hits = result.get("player_hits") or {}
+            total_hits = result.get("total_hits", 0)
 
             # Update status/progress in the main thread
             ability_label = "All abilities" if ability_id is None else str(ability_id)
@@ -250,8 +304,11 @@ if submitted and guild_id is not None:
                     "total_deaths": total_deaths,
                     "player_counts": player_counts,
                     "num_pulls": num_pulls,
+                    "player_hits": player_hits,
+                    "total_hits": total_hits,
                 }
                 all_players.update(player_counts.keys())
+
 
     status_area.empty()
     progress_bar.empty()
@@ -267,7 +324,10 @@ if submitted and guild_id is not None:
     # Build one matrix-style table per target (boss + ability)
     # ----------------------------------------------------------------
     # Group meta rows per target_index
-    per_target_entries: dict[int, list[tuple[str, str, dict[str, int], int]]] = {}
+    per_target_entries: dict[
+        int, list[tuple[str, str, dict[str, int], int, dict[str, int]]]
+    ] = {}
+
     for (target_index, date_str), info in meta_by_target_date.items():
         per_target_entries.setdefault(target_index, []).append(
             (
@@ -275,8 +335,10 @@ if submitted and guild_id is not None:
                 info["code"],
                 info["player_counts"],
                 info.get("num_pulls", 0),
+                info.get("player_hits", {}),
             )
         )
+
 
     tables: dict[int, dict[str, object]] = {}
 
@@ -285,8 +347,10 @@ if submitted and guild_id is not None:
         entries.sort(key=lambda tup: tup[0])  # sort by date_str
 
         # Raw ISO date strings and pulls per date
-        date_columns = [date for (date, _code, _counts, _pulls) in entries]
-        pulls_per_date = {date: pulls for (date, _code, _counts, pulls) in entries}
+        date_columns = [date for (date, _code, _counts, _pulls, _hits) in entries]
+        pulls_per_date = {
+            date: pulls for (date, _code, _counts, pulls, _hits) in entries
+        }
         total_pulls = sum(pulls_per_date.values())
 
         # Build nice DD/MM labels with pulls
@@ -302,20 +366,23 @@ if submitted and guild_id is not None:
             friendly_date_labels.append(label)
 
         # Label for the total column
-        total_col_label = "Total Deaths"
+        base_total_label = "Total Deaths" if metric_is_deaths else "Total Damage Taken"
+        total_col_label = base_total_label
         if total_pulls > 0:
-            total_col_label = f"{total_col_label} ({total_pulls} pulls)"
+            total_col_label = f"{base_total_label} ({total_pulls} pulls)"
 
-        report_codes = [code for (_date, code, _counts, _pulls) in entries]
+        report_codes = [code for (_date, code, _counts, _pulls, _hits) in entries]
 
         # Build per-report player counts and total player set
         per_report_counts: dict[str, dict[str, int]] = {}
+        per_report_hits: dict[str, dict[str, int]] = {}
         players_for_target: set[str] = set()
 
-        for date_str, code, player_counts, _pulls in entries:
+        for date_str, code, player_counts, _pulls, player_hits in entries:
             per_report_counts[code] = player_counts
+            if not metric_is_deaths:
+                per_report_hits[code] = player_hits
             players_for_target.update(player_counts.keys())
-
 
         # Totals per player across all days for this target
         player_totals: dict[str, int] = {}
@@ -330,27 +397,80 @@ if submitted and guild_id is not None:
             key=lambda p: (-player_totals[p], p.lower()),
         )
 
-        # Internal column names (raw, used for boss summary)
-        df_columns_internal = ["Player", "Total Deaths"] + date_columns
+        # In damage mode, also compute total hits per player
+        player_totals_hits: dict[str, int] = {}
+        if not metric_is_deaths:
+            for player in players_for_target:
+                total_hits_player = 0
+                for code in report_codes:
+                    total_hits_player += per_report_hits.get(code, {}).get(player, 0)
+                player_totals_hits[player] = total_hits_player
 
-        rows_for_display: list[list[object]] = []
-        for player in sorted_players:
-            row = [player, player_totals[player]]
-            for _date, code, _counts, _pulls in entries:
-                deaths = per_report_counts.get(code, {}).get(player, 0)
-                row.append(deaths)
-            rows_for_display.append(row)
 
-        # DataFrame with raw column names
-        df = pd.DataFrame(rows_for_display, columns=df_columns_internal)
-        df.reset_index(drop=True, inplace=True)
+        if metric_is_deaths:
+            # -----------------------------
+            # Deaths mode: original layout
+            # -----------------------------
+            df_columns_internal = ["Player", "Total Deaths"] + date_columns
 
-        # DataFrame for display / CSV with pretty labels
-        df_display = df.copy()
-        rename_map = {"Total Deaths": total_col_label}
-        rename_map.update(dict(zip(date_columns, friendly_date_labels)))
-        df_display = df_display.rename(columns=rename_map)
+            rows_for_display: list[list[object]] = []
+            for player in sorted_players:
+                row = [player, player_totals[player]]
+                for _date, code, _counts, _pulls, _hits in entries:
+                    val = per_report_counts.get(code, {}).get(player, 0)
+                    row.append(val)
+                rows_for_display.append(row)
 
+            df = pd.DataFrame(rows_for_display, columns=df_columns_internal)
+            df.reset_index(drop=True, inplace=True)
+
+            df_display = df.copy()
+            rename_map = {"Total Deaths": total_col_label}
+            rename_map.update(dict(zip(date_columns, friendly_date_labels)))
+            df_display = df_display.rename(columns=rename_map)
+
+        else:
+            # -----------------------------------------
+            # Damage mode: Damage + Hits (Excel style)
+            # -----------------------------------------
+            # For each date we create two internal columns: date__damage, date__hits
+            date_damage_cols: list[str] = []
+            for date in date_columns:
+                date_damage_cols.append(f"{date}__damage")
+                date_damage_cols.append(f"{date}__hits")
+
+            # NOTE: internal name "Total Deaths" is kept for compatibility with
+            # boss summary. It now holds "Total Damage Taken".
+            df_columns_internal = ["Player", "Total Deaths", "Total Hits"] + date_damage_cols
+
+            rows_for_display = []
+            for player in sorted_players:
+                row = [
+                    player,
+                    player_totals[player],
+                    player_totals_hits.get(player, 0),
+                ]
+                for _date, code, _counts, _pulls, _hits in entries:
+                    dmg = per_report_counts.get(code, {}).get(player, 0)
+                    hits = per_report_hits.get(code, {}).get(player, 0)
+                    row.append(dmg)
+                    row.append(hits)
+                rows_for_display.append(row)
+
+            df = pd.DataFrame(rows_for_display, columns=df_columns_internal)
+            df.reset_index(drop=True, inplace=True)
+
+            df_display = df.copy()
+            # Total Deaths column label was already built as "Total Damage Taken (X pulls)" in damage mode
+            rename_map = {
+                "Total Deaths": total_col_label,
+                "Total Hits": "Hits",
+            }
+            for date, friendly in zip(date_columns, friendly_date_labels):
+                rename_map[f"{date}__damage"] = f"{friendly} – Damage Taken"
+                rename_map[f"{date}__hits"] = f"{friendly} – Hits"
+
+            df_display = df_display.rename(columns=rename_map)
 
         # CSV header with boss / ability label
         target = targets[target_index]
