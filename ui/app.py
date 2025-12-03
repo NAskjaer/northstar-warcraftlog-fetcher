@@ -108,38 +108,59 @@ end_dt = datetime(
     tzinfo=timezone.utc,
 )
 
-# ====================================================================
 # 2.5. Metric selection (Deaths vs Damage Taken)
-# ====================================================================
 metric_mode = st.radio(
     "What do you want to aggregate?",
-    options=["Deaths", "Damage taken"],
+    options=["Deaths", "Damage taken", "Both"],
     index=0,
-    horizontal=True,
-    help="This only changes what the numbers represent. All filters, sorting and CSV export still work the same.",
+    horizontal=True,   # 👈 makes the radio buttons line up horizontally
 )
-metric_is_deaths = metric_mode == "Deaths"
 
 
+show_deaths = metric_mode in ("Deaths", "Both")
+show_damage = metric_mode in ("Damage taken", "Both")
+
+# Initialise per-metric results cache
+if "results_cache" not in st.session_state:
+    st.session_state["results_cache"] = {"deaths": None, "damage": None}
+
 # ====================================================================
-# 3. Results section (compute OR reuse cached)
+# 3. Results section
 # ====================================================================
-if submitted and guild_id is not None:
+
+def compute_and_cache_results(
+    *,
+    metric_is_deaths: bool,
+    cache_key: str,
+) -> None:
+    """
+    Fetch logs + compute aggregation for a metric (deaths or damage taken)
+    and store the result in st.session_state["results_cache"][cache_key].
+    """
     if not targets:
         st.error("Please configure at least one boss to analyze.")
-        st.session_state["analysis_cache"] = None
-        st.stop()
+        st.session_state["results_cache"][cache_key] = None
+        return
+
+    if guild_id is None:
+        # Guild URL invalid; don't blow away old results, just show error.
+        st.error(
+            "Could not parse guild ID from URL. "
+            "Expected something like https://www.warcraftlogs.com/guild/id/235490"
+        )
+        return
 
     overall_start = time.perf_counter()
+    metric_label = "deaths" if metric_is_deaths else "damage taken"
 
     # --- Fetch reports for guild/date range -----------------------------
-    with st.spinner("Fetching reports from Warcraft Logs…"):
+    with st.spinner(f"Fetching reports from Warcraft Logs for {metric_label}…"):
         reports = fetch_logs_for_guild(guild_id, start_dt, end_dt)
 
     if not reports:
         st.warning("No reports found in that date range.")
-        st.session_state["analysis_cache"] = None
-        st.stop()
+        st.session_state["results_cache"][cache_key] = None
+        return
 
     # --- Build list of jobs (report × target) ---------------------------
     # 1) Group reports by calendar date (based on report start time).
@@ -154,6 +175,7 @@ if submitted and guild_id is not None:
     # 2) For each date, choose the report with the longest duration.
     best_reports_per_date: list[tuple[str, dict]] = []
     for date_str, reps in reports_by_date.items():
+
         def _duration(r: dict) -> int:
             start_ms = r.get("startTime", 0)
             end_ms = r.get("endTime", start_ms)
@@ -163,8 +185,8 @@ if submitted and guild_id is not None:
         best_reports_per_date.append((date_str, best_report))
 
     # 3) Build jobs only for the chosen report for that date.
-    jobs: list[tuple[str, str, int, int, int | None]] = []  # (date_str, code, target_idx, boss_id, ability_id)
-
+    # (date_str, code, target_idx, boss_id, ability_id)
+    jobs: list[tuple[str, str, int, int, int | None]] = []
     for date_str, report in best_reports_per_date:
         code = report["code"]
         for target_index, target in enumerate(targets):
@@ -178,12 +200,11 @@ if submitted and guild_id is not None:
                 )
             )
 
-
     total_jobs = len(jobs)
     if total_jobs == 0:
         st.warning("No report/ability combinations to process.")
-        st.session_state["analysis_cache"] = None
-        st.stop()
+        st.session_state["results_cache"][cache_key] = None
+        return
 
     status_area = st.empty()
     progress_bar = st.progress(0.0)
@@ -206,6 +227,8 @@ if submitted and guild_id is not None:
                     ignore_after_player_deaths=ignore_after_player_deaths,
                 )
                 value_key = "total_deaths"
+                player_hits: dict[str, int] = {}
+                total_hits = 0
             else:
                 rows = get_damage_taken_by_player_for_ability(
                     report_code=code,
@@ -215,29 +238,21 @@ if submitted and guild_id is not None:
                     ignore_after_player_deaths=ignore_after_player_deaths,
                 )
                 value_key = "total_damage"
+                # damage fetcher already returns hits per row
+                player_hits = {
+                    row["player"]: row.get("hits", 0) for row in rows
+                }
+                total_hits = sum(player_hits.values())
         except RuntimeError:
-            # API error – treat as no data for this job
             rows = []
             value_key = "total_deaths" if metric_is_deaths else "total_damage"
-
-        # 2) Build per-player values for this report (main metric)
-        player_counts = {
-            row["player"]: row.get(value_key, 0)
-            for row in rows
-        }
-
-        # In damage mode, also track hits per player.
-        if metric_is_deaths:
-            player_hits: dict[str, int] = {}
+            player_hits = {}
             total_hits = 0
-        else:
-            player_hits = {
-                row["player"]: int(row.get("hits", 0))
-                for row in rows
-            }
-            total_hits = sum(player_hits.values())
 
-        # This is "total metric" (deaths or damage) for compatibility with the rest
+        # 2) Build per-player values for this report
+        player_counts = {
+            row["player"]: row.get(value_key, 0) for row in rows
+        }
         total_deaths = sum(player_counts.values())
 
         # 3) Count pulls for this boss in this report
@@ -255,17 +270,19 @@ if submitted and guild_id is not None:
             "date_str": date_str,
             "code": code,
             "target_index": target_index,
-            "total_deaths": total_deaths,   # main metric
-            "player_counts": player_counts, # per-player metric
-            "total_hits": total_hits,       # only non-zero in damage mode
-            "player_hits": player_hits,
+            "total_deaths": total_deaths,
+            "player_counts": player_counts,
             "boss_id": boss_id,
             "ability_id": ability_id,
             "num_pulls": num_pulls,
+            "player_hits": player_hits,
+            "total_hits": total_hits,
         }
 
     # --- Run jobs in parallel -------------------------------------------
-    max_workers = 8  # tweak if needed
+    max_workers = 8
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(process_job, job) for job in jobs]
 
@@ -280,16 +297,13 @@ if submitted and guild_id is not None:
             boss_id = result["boss_id"]
             ability_id = result["ability_id"]
             num_pulls = result["num_pulls"]
-
-            # Damage mode: hits per player / total hits
             player_hits = result.get("player_hits") or {}
             total_hits = result.get("total_hits", 0)
 
-            # Update status/progress in the main thread
             ability_label = "All abilities" if ability_id is None else str(ability_id)
             status_area.write(
                 f"Processed {i}/{total_jobs} jobs "
-                f"(report={code}, boss_id={boss_id}, ability={ability_label})..."
+                f"(report={code}, boss_id={boss_id}, ability={ability_label})."
             )
             progress_bar.progress(i / total_jobs)
 
@@ -309,25 +323,26 @@ if submitted and guild_id is not None:
                 }
                 all_players.update(player_counts.keys())
 
-
     status_area.empty()
     progress_bar.empty()
 
     if not meta_by_target_date:
-        st.warning(
+        msg = (
             "No deaths found for the selected bosses/abilities in this date range."
+            if metric_is_deaths
+            else "No damage taken found for the selected bosses/abilities "
+                 "in this date range."
         )
-        st.session_state["analysis_cache"] = None
-        st.stop()
+        st.warning(msg)
+        st.session_state["results_cache"][cache_key] = None
+        return
 
     # ----------------------------------------------------------------
     # Build one matrix-style table per target (boss + ability)
     # ----------------------------------------------------------------
-    # Group meta rows per target_index
     per_target_entries: dict[
         int, list[tuple[str, str, dict[str, int], int, dict[str, int]]]
     ] = {}
-
     for (target_index, date_str), info in meta_by_target_date.items():
         per_target_entries.setdefault(target_index, []).append(
             (
@@ -339,12 +354,11 @@ if submitted and guild_id is not None:
             )
         )
 
-
     tables: dict[int, dict[str, object]] = {}
 
     for target_index, entries in per_target_entries.items():
         # Sort days for this target
-        entries.sort(key=lambda tup: tup[0])  # sort by date_str
+        entries.sort(key=lambda tup: tup[0])
 
         # Raw ISO date strings and pulls per date
         date_columns = [date for (date, _code, _counts, _pulls, _hits) in entries]
@@ -354,9 +368,11 @@ if submitted and guild_id is not None:
         total_pulls = sum(pulls_per_date.values())
 
         # Build nice DD/MM labels with pulls
+        from datetime import datetime as _dt
+
         friendly_date_labels: list[str] = []
         for date in date_columns:
-            dt = datetime.strptime(date, "%Y-%m-%d").date()
+            dt = _dt.strptime(date, "%Y-%m-%d").date()
             base = dt.strftime("%d/%m")
             pulls = pulls_per_date.get(date, 0)
             if pulls > 0:
@@ -365,15 +381,16 @@ if submitted and guild_id is not None:
                 label = base
             friendly_date_labels.append(label)
 
-        # Label for the total column
-        base_total_label = "Total Deaths" if metric_is_deaths else "Total Damage Taken"
+        base_total_label = (
+            "Total Deaths" if metric_is_deaths else "Total Damage Taken"
+        )
         total_col_label = base_total_label
         if total_pulls > 0:
             total_col_label = f"{base_total_label} ({total_pulls} pulls)"
 
         report_codes = [code for (_date, code, _counts, _pulls, _hits) in entries]
 
-        # Build per-report player counts and total player set
+        # Build per-report player counts and totals
         per_report_counts: dict[str, dict[str, int]] = {}
         per_report_hits: dict[str, dict[str, int]] = {}
         players_for_target: set[str] = set()
@@ -384,7 +401,6 @@ if submitted and guild_id is not None:
                 per_report_hits[code] = player_hits
             players_for_target.update(player_counts.keys())
 
-        # Totals per player across all days for this target
         player_totals: dict[str, int] = {}
         for player in players_for_target:
             total = 0
@@ -397,22 +413,9 @@ if submitted and guild_id is not None:
             key=lambda p: (-player_totals[p], p.lower()),
         )
 
-        # In damage mode, also compute total hits per player
-        player_totals_hits: dict[str, int] = {}
-        if not metric_is_deaths:
-            for player in players_for_target:
-                total_hits_player = 0
-                for code in report_codes:
-                    total_hits_player += per_report_hits.get(code, {}).get(player, 0)
-                player_totals_hits[player] = total_hits_player
-
-
         if metric_is_deaths:
-            # -----------------------------
-            # Deaths mode: original layout
-            # -----------------------------
+            # Deaths: just one metric column
             df_columns_internal = ["Player", "Total Deaths"] + date_columns
-
             rows_for_display: list[list[object]] = []
             for player in sorted_players:
                 row = [player, player_totals[player]]
@@ -428,20 +431,25 @@ if submitted and guild_id is not None:
             rename_map = {"Total Deaths": total_col_label}
             rename_map.update(dict(zip(date_columns, friendly_date_labels)))
             df_display = df_display.rename(columns=rename_map)
-
         else:
-            # -----------------------------------------
-            # Damage mode: Damage + Hits (Excel style)
-            # -----------------------------------------
-            # For each date we create two internal columns: date__damage, date__hits
+            # Damage mode: Damage + Hits
             date_damage_cols: list[str] = []
             for date in date_columns:
                 date_damage_cols.append(f"{date}__damage")
                 date_damage_cols.append(f"{date}__hits")
 
-            # NOTE: internal name "Total Deaths" is kept for compatibility with
-            # boss summary. It now holds "Total Damage Taken".
-            df_columns_internal = ["Player", "Total Deaths", "Total Hits"] + date_damage_cols
+            df_columns_internal = (
+                ["Player", "Total Deaths", "Total Hits"] + date_damage_cols
+            )
+
+            player_totals_hits: dict[str, int] = {}
+            for player in players_for_target:
+                total_hits_player = 0
+                for code in report_codes:
+                    total_hits_player += per_report_hits.get(code, {}).get(
+                        player, 0
+                    )
+                player_totals_hits[player] = total_hits_player
 
             rows_for_display = []
             for player in sorted_players:
@@ -461,7 +469,6 @@ if submitted and guild_id is not None:
             df.reset_index(drop=True, inplace=True)
 
             df_display = df.copy()
-            # Total Deaths column label was already built as "Total Damage Taken (X pulls)" in damage mode
             rename_map = {
                 "Total Deaths": total_col_label,
                 "Total Hits": "Hits",
@@ -491,10 +498,18 @@ if submitted and guild_id is not None:
             writer.writerow(r)
         csv_bytes = csv_buffer.getvalue().encode("utf-8")
 
+        # Build per-column log metadata (for links in the UI)
+        # friendly_date_labels and report_codes are in the same order
+        log_links = [
+            {"label": label, "report_code": code}
+            for label, code in zip(friendly_date_labels, report_codes)
+        ]
+
         tables[target_index] = {
-            "df": df,               # raw (used for boss summary)
-            "df_display": df_display,  # pretty (for single-ability view)
+            "df": df,                    # raw (used for boss summary)
+            "df_display": df_display,    # pretty (for single-ability view)
             "csv_bytes": csv_bytes,
+            "log_links": log_links,      # <--- NEW: log metadata
         }
 
 
@@ -507,37 +522,79 @@ if submitted and guild_id is not None:
         boss_to_targets.setdefault(tgt["boss_id"], []).append(idx)
 
     elapsed = time.perf_counter() - overall_start
+    metric_text = "Deaths" if metric_is_deaths else "Damage taken"
+    st.caption(
+        f"{metric_text} aggregation finished in {elapsed:0.1f}s – "
+        f"{num_reports} reports, {num_players} players."
+    )
 
-    # Cache everything for later interactions (download/search/summary)
-    st.session_state["analysis_cache"] = {
+    # Store everything needed to re-render without recomputing
+    st.session_state["results_cache"][cache_key] = {
         "tables": tables,
         "targets": targets,
         "num_reports": num_reports,
         "num_players": num_players,
         "boss_to_targets": boss_to_targets,
-        "elapsed_seconds": elapsed,
     }
 
-else:
-    # --- Reuse cached results if available --------------------------
-    cache = st.session_state.get("analysis_cache")
+
+def render_from_cache(
+    *,
+    metric_is_deaths: bool,
+    cache_key: str,
+    key_prefix: str,
+    section_title: str,
+) -> None:
+    """Render results for a metric using cached data (if available)."""
+    cache_root = st.session_state.get("results_cache", {})
+    cache = cache_root.get(cache_key)
     if not cache:
-        st.stop()  # nothing to show yet
+        st.info("No results for this metric yet. Click **Generate CSV** above.")
+        return
 
-    tables = cache["tables"]
-    targets = cache["targets"]
-    num_reports = cache["num_reports"]
-    num_players = cache["num_players"]
+    from sections.results_section import render_results
+
+    render_results(
+        cache["tables"],
+        cache["targets"],
+        cache["num_reports"],
+        cache["num_players"],
+        cache["boss_to_targets"],
+        metric_is_deaths,
+        key_prefix=key_prefix,
+        section_title=section_title,
+    )
+
 
 # --------------------------------------------------------------------
-# Display results (delegated to sections/results_section.py)
+# Trigger computation (on button click) and always render from cache
 # --------------------------------------------------------------------
-elapsed = None
-cache = st.session_state.get("analysis_cache")
-if cache and "elapsed_seconds" in cache:
-    elapsed = cache["elapsed_seconds"]
+if submitted and guild_id is not None:
+    if show_deaths:
+        compute_and_cache_results(
+            metric_is_deaths=True,
+            cache_key="deaths",
+        )
+    if show_damage:
+        compute_and_cache_results(
+            metric_is_deaths=False,
+            cache_key="damage",
+        )
 
-if elapsed is not None:
-    st.caption(f"Analysis time (fetch + tables): {elapsed:.1f} seconds.")
+# Always render whatever we have cached, based on current metric_mode
+if show_deaths:
+    render_from_cache(
+        metric_is_deaths=True,
+        cache_key="deaths",
+        key_prefix="deaths_",
+        section_title="### 3. Results — Deaths",
+    )
 
-render_results(tables, targets, num_reports, num_players)
+if show_damage:
+    sec_number = "4" if show_deaths else "3"
+    render_from_cache(
+        metric_is_deaths=False,
+        cache_key="damage",
+        key_prefix="damage_",
+        section_title=f"### {sec_number}. Results — Damage taken",
+    )
