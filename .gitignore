@@ -1,3 +1,50 @@
+# ---- ENVIRONMENT FILES ----
 .env
+*.env
+config/.env
+
+# ---- PYTHON CACHE / BUILD ----
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+*.pkl
+*.pklz
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# ---- OUTPUT / GENERATED FILES ----
 /output
 /output/*
+
+# ---- STREAMLIT / LOCAL STATE ----
+.streamlit/
+
+# ---- VSCODE / EDITOR JUNK ----
+.vscode/
+*.code-workspace
+
+# ---- OS-LEVEL TRASH FILES ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- LOGS ----
+*.log
+
+# ---- DEVELOPMENT / MISC ----
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+
+# ---- PYTHON VENV ----
+.venv/
+venv/
+ENV/
+env/

@@ -1,0 +1,70 @@
+{
+  "bosses": {
+    "Imperator Averzian": {
+      "id": 3176,
+      "raid": "The Voidspire",
+      "abilities": []
+    },
+    "Vorasius": {
+      "id": 3177,
+      "raid": "The Voidspire",
+      "abilities": []
+    },
+    "Fallen-King Salhadaar": {
+      "id": 3179,
+      "raid": "The Voidspire",
+      "abilities": []
+    },
+    "Vaelgor & Ezzorak": {
+      "id": 3178,
+      "raid": "The Voidspire",
+      "abilities": []
+    },
+    "Lightblinded Vanguard": {
+      "id": 3180,
+      "raid": "The Voidspire",
+      "abilities": []
+    },
+    "Crown of the Cosmos": {
+      "id": 3181,
+      "raid": "The Voidspire",
+      "abilities": []
+    },
+    "Chimaerus, the Undreamt God": {
+      "id": 3306,
+      "raid": "The Dreamrift",
+      "abilities": []
+    },
+    "Belo'ren, Child of Al'ar": {
+      "id": 3182,
+      "raid": "March on Quel'Danas",
+      "abilities": []
+    },
+    "Midnight Falls": {
+      "id": 3183,
+      "raid": "March on Quel'Danas",
+      "abilities": [
+        1254076,
+        1249797,
+        1286276,
+        1284699,
+        1251789,
+        1282028,
+        1249585,
+        1276173,
+        1276526
+      ]
+    }
+  },
+  "ability_names": {
+    "1254076": "Heaven's Glaives",
+    "1249797": "Shattered Sky",
+    "1286276": "Terminate",
+    "1284699": "Light's End",
+    "1251789": "Cosmic Fracture",
+    "1282028": "The Darkwell",
+    "1249585": "Dissonance",
+    "1276173": "Severance",
+    "1276526": "Heaven & Hell"
+  }
+}

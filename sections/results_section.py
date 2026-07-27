@@ -5,18 +5,25 @@ from typing import Dict, List, Any
 import pandas as pd
 import streamlit as st
 
-from sections.input_settings import ABILITY_NAMES
+from src import boss_config
 
 
-def _target_label(target: dict) -> str:
+def _get_ability_name(ability_id: int, raid_file: str) -> str:
+    """Get ability name from the current raid configuration."""
+    ability_names = boss_config.get_ability_names(raid_file)
+    return ability_names.get(ability_id, "Unknown")
+
+
+def _target_label(target: dict, raid_file: str) -> str:
+    """Pretty label like 'Nexus-King Salhadaar — 1227472 (Besiege)' or 'All abilities'."""
     boss_name = target.get("boss_name", "Unknown boss")
     ability_id = target.get("ability_id")
 
     if ability_id is None:
         return f"{boss_name} — All abilities"
 
-    ability_name = ABILITY_NAMES.get(ability_id)
-    if ability_name:
+    ability_name = _get_ability_name(ability_id, raid_file)
+    if ability_name and ability_name != "Unknown":
         return f"{boss_name} — {ability_id} ({ability_name})"
     return f"{boss_name} — {ability_id}"
 
@@ -28,30 +35,27 @@ def render_results(
     num_players: int,
     boss_to_targets: Dict[int, List[int]],
     metric_is_deaths: bool,
+    raid_file: str,
     *,
     key_prefix: str = "",
     section_title: str | None = None,
 ) -> None:
     """
-    Render the results UI (single ability + boss summary).
+    Render the results UI:
 
-    tables[target_index] = {
-        "df":        DataFrame with internal columns
-        "df_display": DataFrame with pretty column names
-        "csv_bytes": CSV bytes for download
-    }
+      • Single ability view (one table at a time, chosen via dropdown)
+      • Boss summary view (sum multiple abilities per boss)
     """
     if not tables:
         st.warning("No data available to display.")
         return
 
+    # Total rows across all tables (for the green banner)
     total_rows = sum(len(t["df"]) for t in tables.values())
 
-    if section_title is None:
-        metric_label = "Deaths" if metric_is_deaths else "Damage taken"
-        section_title = f"### 3. Results — {metric_label}"
-
-    st.markdown(section_title)
+    # Section header (in practice the expander already has the title)
+    if section_title:
+        st.markdown(section_title)
 
     st.success(
         f"Found {total_rows} report-day entries across {num_players} players "
@@ -71,26 +75,29 @@ def render_results(
     # Single ability view
     # ------------------------------------------------------------------ #
     if view_mode == "Single ability view":
+        # All target indices that actually have data
         available_indices = sorted(tables.keys())
+        if not available_indices:
+            st.warning("No tables to show.")
+            return
 
         option_labels = [
-            _target_label(targets[idx]) for idx in available_indices
+            _target_label(targets[idx], raid_file) for idx in available_indices
         ]
 
-        selected_idx = st.selectbox(
+        selected_idx_pos = st.selectbox(
             "Boss / ability to inspect",
             options=list(range(len(available_indices))),
             format_func=lambda i: option_labels[i],
             key=f"{key_prefix}single_select",
         )
-        target_index = available_indices[selected_idx]
+        target_index = available_indices[selected_idx_pos]
         target = targets[target_index]
         data = tables[target_index]
 
-        st.markdown(
-            f"**Selected:** {_target_label(target)}"
-        )
+        st.markdown(f"**Selected:** {_target_label(target, raid_file)}")
 
+        # Player search
         search = st.text_input(
             "Search player",
             value="",
@@ -100,27 +107,19 @@ def render_results(
 
         df_display: pd.DataFrame = data["df_display"]
         if search:
-            mask = df_display["Player"].str.contains(search, case=False, na=False)
+            mask = df_display["Player"].str.contains(
+                search, case=False, na=False
+            )
             df_display = df_display[mask]
+
+        # Show a 1-based row number instead of the default 0-based index.
+        df_display = df_display.reset_index(drop=True)
+        df_display.index = range(1, len(df_display) + 1)
 
         st.dataframe(
             df_display,
-            width="stretch",
+            use_container_width=True,
         )
-
-        # ------------------------------------------------------------
-        # Hyperlinks under the table (single ability)
-        # ------------------------------------------------------------
-        log_links = tables[target_index].get("log_links", [])
-        if log_links:
-            st.markdown("**Logs used for this table:**")
-            for entry in log_links:
-                label = entry["label"]
-                code = entry["report_code"]
-                url = f"https://www.warcraftlogs.com/reports/{code}"
-                st.markdown(f"- **{label}** — [Open log]({url})")
-
-
 
         st.download_button(
             "Download CSV",
@@ -129,12 +128,24 @@ def render_results(
             mime="text/csv",
             key=f"{key_prefix}single_download",
         )
+
+        # Per-table log links
+        log_links = data.get("log_links", [])
+        if log_links:
+            st.markdown("**Logs used for this table:**")
+            for entry in log_links:
+                label = entry["label"]
+                code = entry["report_code"]
+                url = f"https://www.warcraftlogs.com/reports/{code}"
+                st.markdown(f"- **{label}** — [Open log]({url})")
+
+        # Done for single ability view
         return
 
     # ------------------------------------------------------------------ #
     # Boss summary view (sum multiple abilities per boss)
     # ------------------------------------------------------------------ #
-    # Build boss options that actually have tables
+    # Build list of bosses that actually have tables
     boss_options: List[int] = []
     boss_labels: List[str] = []
     for boss_id, idxs in boss_to_targets.items():
@@ -158,67 +169,50 @@ def render_results(
     boss_id = boss_options[boss_pos]
     target_indices = [i for i in boss_to_targets[boss_id] if i in tables]
 
-    # Collect raw DataFrames for this boss and concatenate
-    print("\n========== DEBUG: BOSS SUMMARY ==========")
-    print("Target indices:", target_indices)
-
-    raw_dfs = []
-    for i in target_indices:
-        print(f"\n--- RAW DF for table {i} ---")
-        print(tables[i]["df"])
-        raw_dfs.append(tables[i]["df"])
-
+    # Collect all underlying internal DataFrames for this boss
+    raw_dfs = [tables[i]["df"] for i in target_indices]
     merged = pd.concat(raw_dfs, axis=0, ignore_index=True)
-    print("\n--- MERGED DF ---")
-    print(merged)
-    print("Merged columns:", merged.columns.tolist())
 
-    # Identify which columns are numeric OR should be treated numeric
+    # Everything except "Player" should be numeric; coerce as needed
     value_cols = [c for c in merged.columns if c != "Player"]
-    print("Value columns selected for sum:", value_cols)
-
-    # Convert everything except Player to numeric (coerce errors → NaN → 0)
     merged_numeric = merged.copy()
     for c in value_cols:
-        merged_numeric[c] = pd.to_numeric(merged_numeric[c], errors="coerce").fillna(0).astype(int)
+        merged_numeric[c] = pd.to_numeric(
+            merged_numeric[c],
+            errors="coerce",
+        ).fillna(0)
 
-    print("\n--- MERGED (FORCED NUMERIC) ---")
-    print(merged_numeric)
+    # Sum across abilities per player
+    grouped = merged_numeric.groupby("Player", as_index=False)[value_cols].sum()
 
-    # Now aggregate
-    group = merged_numeric.groupby("Player", as_index=False)[value_cols].sum()
-    print("\n--- GROUPED DF ---")
-    print(group)
-
-    # Build pretty rename map
+    # Map internal column names -> pretty names using first table as template
     template = tables[target_indices[0]]
-    template_display = template["df_display"]
-
     raw_cols = list(template["df"].columns)
-    pretty_cols = list(template_display.columns)
-
-    print("\nRaw template columns:", raw_cols)
-    print("Pretty template columns:", pretty_cols)
+    pretty_cols = list(template["df_display"].columns)
 
     rename_map = {}
-    for col in group.columns:
+    for col in grouped.columns:
         if col in raw_cols:
-            raw_index = raw_cols.index(col)
-            rename_map[col] = pretty_cols[raw_index]
+            idx = raw_cols.index(col)
+            rename_map[col] = pretty_cols[idx]
         else:
+            # New columns (if any) keep their internal name
             rename_map[col] = col
 
-    print("Rename map:", rename_map)
+    df_display = grouped.rename(columns=rename_map)
 
-    df_display = group.rename(columns=rename_map)
-    print("\n--- FINAL DF_DISPLAY (what Streamlit shows) ---")
-    print(df_display)
-    print("===============================================\n")
+    # Embed each player's pull (attendance) count into the display name.
+    # Pulls are per-boss, so they're identical across this boss's ability
+    # tables; merge them (max is a safe combiner) and format the name.
+    combined_pulls: Dict[str, int] = {}
+    for i in target_indices:
+        for name, n in tables[i].get("player_pulls", {}).items():
+            combined_pulls[name] = max(combined_pulls.get(name, 0), n)
+    df_display["Player"] = df_display["Player"].map(
+        lambda name: f"{name} (Pulls: {combined_pulls.get(name, 0)})"
+    )
 
-    # ----------------------------------------------------
-    # Add hyperlinks to date columns in the column headers
-    # ----------------------------------------------------
-
+    # Search within boss summary
     search_summary = st.text_input(
         "Search player",
         value="",
@@ -231,17 +225,19 @@ def render_results(
         )
         df_display = df_display[mask]
 
+    # Show a 1-based row number instead of the default 0-based index.
+    df_display = df_display.reset_index(drop=True)
+    df_display.index = range(1, len(df_display) + 1)
+
     st.dataframe(
         df_display,
-        width="stretch",
+        use_container_width=True,
     )
 
     # ------------------------------------------------------------
     # Hyperlinks under the Boss Summary table
     # ------------------------------------------------------------
-    # Build a combined list of logs actually used in the summary
-    combined_links = []
-
+    combined_links: List[dict] = []
     for idx in target_indices:
         for entry in tables[idx].get("log_links", []):
             if entry not in combined_links:
@@ -255,8 +251,8 @@ def render_results(
             url = f"https://www.warcraftlogs.com/reports/{code}"
             st.markdown(f"- **{label}** — [Open log]({url})")
 
-    # Build a CSV just like in single mode
-    csv_buffer = []
+    # Build CSV for boss summary
+    csv_buffer: List[str] = []
     csv_header = [boss_labels[boss_pos], "Boss summary (all abilities)"]
     csv_buffer.append(",".join(csv_header))
     csv_buffer.append(",".join(str(c) for c in df_display.columns))

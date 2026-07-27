@@ -8,34 +8,41 @@ from src.api_client import run_wcl_query
 
 # Always use the config folder next to project root
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
-_CONFIG_DIR = _PROJECT_ROOT / "config"
-_CONFIG_DIR.mkdir(exist_ok=True)
+_CONFIG_DIR = _PROJECT_ROOT / "config" / "bosses"
+_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
-_BOSSES_JSON_PATH = _CONFIG_DIR / "bosses.json"
+# Default raid files
+_DEFAULT_RAID_FILE = "Manaforge_Omega.json"
+
+# In-memory cache per raid file
+_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
-# In-memory cache
-_CACHE: Dict[str, Any] | None = None
+def _get_raid_json_path(raid_file: str) -> Path:
+    """Get the full path for a specific raid JSON file."""
+    return _CONFIG_DIR / raid_file
 
 
-def _ensure_json_exists() -> None:
-    """Create an empty bosses.json if missing (but never seed defaults)."""
-    if not _BOSSES_JSON_PATH.exists():
+def _ensure_json_exists(raid_file: str) -> None:
+    """Create an empty raid JSON file if missing (but never seed defaults)."""
+    json_path = _get_raid_json_path(raid_file)
+    if not json_path.exists():
         empty = {"bosses": {}, "ability_names": {}}
-        _BOSSES_JSON_PATH.write_text(json.dumps(empty, indent=2), encoding="utf-8")
+        json_path.write_text(json.dumps(empty, indent=2), encoding="utf-8")
 
 
-def _load_raw() -> Dict[str, Any]:
+def _load_raw(raid_file: str = _DEFAULT_RAID_FILE) -> Dict[str, Any]:
     """Load JSON exactly as stored. No default seeding."""
     global _CACHE
 
-    if _CACHE is not None:
-        return _CACHE
+    if raid_file in _CACHE:
+        return _CACHE[raid_file]
 
-    _ensure_json_exists()
+    _ensure_json_exists(raid_file)
+    json_path = _get_raid_json_path(raid_file)
 
     try:
-        data = json.loads(_BOSSES_JSON_PATH.read_text(encoding="utf-8"))
+        data = json.loads(json_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         data = {"bosses": {}, "ability_names": {}}
 
@@ -43,27 +50,28 @@ def _load_raw() -> Dict[str, Any]:
     data.setdefault("bosses", {})
     data.setdefault("ability_names", {})
 
-    _CACHE = data
+    _CACHE[raid_file] = data
     return data
 
 
-def _save_raw(data: Dict[str, Any]) -> None:
-    """Save bosses.json and update cache."""
+def _save_raw(data: Dict[str, Any], raid_file: str = _DEFAULT_RAID_FILE) -> None:
+    """Save raid JSON file and update cache."""
     global _CACHE
-    _CACHE = data
+    _CACHE[raid_file] = data
 
     data.setdefault("bosses", {})
     data.setdefault("ability_names", {})
 
-    _BOSSES_JSON_PATH.write_text(
+    json_path = _get_raid_json_path(raid_file)
+    json_path.write_text(
         json.dumps(data, indent=2),
         encoding="utf-8"
     )
 
 
-def get_boss_options() -> Dict[str, Dict[str, Any]]:
-    """Return bosses with ids and abilities from JSON."""
-    raw = _load_raw()
+def get_boss_options(raid_file: str = _DEFAULT_RAID_FILE) -> Dict[str, Dict[str, Any]]:
+    """Return bosses with ids and abilities from the specified raid JSON."""
+    raw = _load_raw(raid_file)
     bosses = {}
 
     for boss_name, info in raw["bosses"].items():
@@ -84,8 +92,9 @@ def get_boss_options() -> Dict[str, Dict[str, Any]]:
     return bosses
 
 
-def get_ability_names() -> Dict[int, str]:
-    raw = _load_raw()
+def get_ability_names(raid_file: str = _DEFAULT_RAID_FILE) -> Dict[int, str]:
+    """Return ability names from the specified raid JSON."""
+    raw = _load_raw(raid_file)
     out = {}
     for key, val in raw["ability_names"].items():
         try:
@@ -95,9 +104,15 @@ def get_ability_names() -> Dict[int, str]:
     return out
 
 
-def add_ability(boss_name: str, boss_id: int, ability_id: int, label: str) -> None:
-    """Add an ability to a boss and persist to JSON."""
-    data = _load_raw()
+def add_ability(
+    boss_name: str, 
+    boss_id: int, 
+    ability_id: int, 
+    label: str,
+    raid_file: str = _DEFAULT_RAID_FILE
+) -> None:
+    """Add an ability to a boss and persist to the specified raid JSON."""
+    data = _load_raw(raid_file)
 
     boss_entry = data["bosses"].setdefault(
         boss_name,
@@ -111,10 +126,11 @@ def add_ability(boss_name: str, boss_id: int, ability_id: int, label: str) -> No
 
     data["ability_names"][str(int(ability_id))] = label
 
-    _save_raw(data)
+    _save_raw(data, raid_file)
 
 
 def lookup_ability_name(ability_id: int) -> str | None:
+    """Look up ability name from Warcraft Logs API."""
     query = """
     query ($id: Int!) {
       gameData {
@@ -134,3 +150,15 @@ def lookup_ability_name(ability_id: int) -> str | None:
     if not ability:
         return None
     return ability.get("name") or None
+
+
+def invalidate_cache(raid_file: str | None = None) -> None:
+    """
+    Invalidate cache for a specific raid file, or all caches if raid_file is None.
+    Useful when switching between raids or after manual JSON edits.
+    """
+    global _CACHE
+    if raid_file is None:
+        _CACHE.clear()
+    else:
+        _CACHE.pop(raid_file, None)

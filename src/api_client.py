@@ -1,6 +1,20 @@
 # src/api_client.py
 import os
 import time
+
+# Make Python's SSL use the operating-system certificate store *before* requests
+# is imported. On machines where antivirus/proxy software (e.g. Norton) performs
+# HTTPS/TLS inspection, the presented certificate is signed by a private root CA
+# that lives in the Windows cert store but NOT in certifi's bundle. Without this,
+# every Warcraft Logs API call fails with CERTIFICATE_VERIFY_FAILED.
+try:
+    import truststore
+
+    truststore.inject_into_ssl()
+except Exception:
+    # truststore is optional; if it's unavailable we fall back to certifi.
+    pass
+
 import requests
 from dotenv import load_dotenv
 

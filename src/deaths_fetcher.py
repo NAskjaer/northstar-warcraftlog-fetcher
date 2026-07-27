@@ -35,6 +35,7 @@ def get_boss_fights_for_report(
             kill
             startTime
             endTime
+            friendlyPlayers
           }
         }
       }
@@ -65,6 +66,7 @@ def get_boss_fights_for_report(
     )
 
     return boss_fights
+
 
 def _fetch_death_events(
     report_code: str,
@@ -145,6 +147,7 @@ def _fetch_death_events(
 
     return events
 
+
 def _fetch_player_actors(report_code: str) -> Dict[int, str]:
     """
     Fetch player actors (id -> name) for this report.
@@ -185,15 +188,15 @@ def _fetch_player_actors(report_code: str) -> Dict[int, str]:
     print(f"  [deaths_fetcher] Report {report_code}: loaded {len(id_to_name)} actors.")
     return id_to_name
 
+
 def get_deaths_by_player_for_ability(
     report_code: str,
     boss_id: int,
-    ability_id: int,
+    ability_id: int | None,
     difficulty: int | None = 5,
+    wipes_only: bool = True,
     ignore_after_player_deaths: int | None = None,
 ) -> List[Dict[str, Any]]:
-
-
     """
     For a single report, return total deaths BY PLAYER for a given boss + ability.
 
@@ -204,12 +207,14 @@ def get_deaths_by_player_for_ability(
       ]
 
     - Filters fights by encounterID and difficulty.
+    - If wipes_only is True, only non-kill pulls (kill == False) are counted.
     - Builds a time window covering all those fights.
     - Fetches all death events in that window.
     - Keeps only:
         type == "death"
         fight is one of the boss fights
-        abilityGameID == ability_id OR killingAbilityGameID == ability_id
+        (if ability_id is not None)
+            abilityGameID == ability_id OR killingAbilityGameID == ability_id
     """
     fights = get_boss_fights_for_report(report_code, boss_id, difficulty)
 
@@ -219,6 +224,17 @@ def get_deaths_by_player_for_ability(
             f"no fights found for boss {boss_id} (difficulty={difficulty})."
         )
         return []
+
+    # Optionally keep only wipes (non-kill pulls)
+    if wipes_only:
+        fights = [f for f in fights if not f.get("kill")]
+        print(
+            f"  [deaths_fetcher] Report {report_code}: "
+            f"{len(fights)} wipe fights after wipes_only filter "
+            f"(boss_id={boss_id})."
+        )
+        if not fights:
+            return []
 
     fight_ids = [f["id"] for f in fights]
     start_time = min(f["startTime"] for f in fights)
@@ -240,7 +256,6 @@ def get_deaths_by_player_for_ability(
     )
     if death_events:
         print(f"    Sample death event: {death_events[0]}")
-
 
     # Filter down to:
     #   - the boss fights

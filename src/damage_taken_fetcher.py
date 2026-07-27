@@ -82,6 +82,7 @@ def get_damage_taken_by_player_for_ability(
     boss_id: int,
     ability_id: int | None,
     difficulty: int | None = 5,
+    wipes_only: bool = True,
     ignore_after_player_deaths: int | None = None,
 ) -> List[Dict[str, Any]]:
     """
@@ -106,6 +107,17 @@ def get_damage_taken_by_player_for_ability(
             f"no fights found for boss {boss_id} (difficulty={difficulty})."
         )
         return []
+
+    # Optionally keep only wipes (non-kill pulls)
+    if wipes_only:
+        fights = [f for f in fights if not f.get("kill")]
+        print(
+            f"  [damage_taken_fetcher] Report {report_code}: "
+            f"{len(fights)} wipe fights after wipes_only filter "
+            f"(boss_id={boss_id})."
+        )
+        if not fights:
+            return []
 
     fight_ids = [f["id"] for f in fights]
     start_time = min(f["startTime"] for f in fights)

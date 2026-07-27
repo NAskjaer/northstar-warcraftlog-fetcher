@@ -7,26 +7,46 @@ import streamlit as st
 
 from src import boss_config
 
-# Load boss / ability configuration from JSON
-ABILITY_NAMES: Dict[int, str] = boss_config.get_ability_names()
-BOSS_OPTIONS: Dict[str, Dict[str, Any]] = boss_config.get_boss_options()
-
 DIFFICULTY: int = 5  # always Mythic
+
+# Available raid files
+RAID_FILES = {
+    "Omega Manaforge": "Manaforge_Omega.json",
+    "Midnight Season 1": "Midnight_season_1.json"
+}
+
+
+def _get_current_raid_file() -> str:
+    """Get the currently selected raid file."""
+    if "selected_raid_file" not in st.session_state:
+        st.session_state["selected_raid_file"] = "Midnight_season_1.json"
+    return st.session_state["selected_raid_file"]
+
+
+def _reload_boss_config():
+    """Reload boss configuration from the currently selected raid file."""
+    raid_file = _get_current_raid_file()
+    return boss_config.get_ability_names(raid_file), boss_config.get_boss_options(raid_file)
 
 
 def _init_boss_blocks() -> None:
     """Initialise the boss_blocks structure in session_state if needed."""
     if "boss_blocks" not in st.session_state:
-        boss_names = list(BOSS_OPTIONS.keys())
+        _, boss_options = _reload_boss_config()
+        boss_names = list(boss_options.keys())
         if not boss_names:
             st.session_state["boss_blocks"] = []
             st.session_state["next_boss_block_id"] = 0
             return
 
+        # Prefer "Midnight Falls" as the default boss (fewer clicks for the
+        # common case); fall back to the first boss for other raids.
+        default_boss = "Midnight Falls" if "Midnight Falls" in boss_names else boss_names[0]
+
         st.session_state["boss_blocks"] = [
             {
                 "id": 0,
-                "boss_name": boss_names[0],
+                "boss_name": default_boss,
                 "selected_abilities": [],
             }
         ]
@@ -34,17 +54,18 @@ def _init_boss_blocks() -> None:
 
 
 def _build_targets_from_blocks(
-    boss_blocks: List[Dict[str, Any]]
+    boss_blocks: List[Dict[str, Any]],
+    boss_options: Dict[str, Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
     """Build the list of (boss, ability) targets from the UI blocks."""
     targets: List[Dict[str, Any]] = []
 
     for block in boss_blocks:
         boss_name = block.get("boss_name")
-        if not boss_name or boss_name not in BOSS_OPTIONS:
+        if not boss_name or boss_name not in boss_options:
             continue
 
-        boss_info = BOSS_OPTIONS[boss_name]
+        boss_info = boss_options[boss_name]
         selected_abilities = block.get("selected_abilities") or []
 
         if selected_abilities:
@@ -79,10 +100,45 @@ def render_input_settings() -> Tuple[
 ]:
     """Render the '2. Input settings' section and return user choices."""
 
-    _init_boss_blocks()
-
     with st.expander("2. Input settings", expanded=True):
         st.markdown("Configure which logs to analyze and how to group deaths.")
+
+        # ------------------------------------------------------------------
+        # Raid selection dropdown
+        # ------------------------------------------------------------------
+        st.markdown("**Select Raid**")
+        
+        # Get current selection display name
+        current_file = _get_current_raid_file()
+        current_display = next(
+            (name for name, file in RAID_FILES.items() if file == current_file),
+            list(RAID_FILES.keys())[0]
+        )
+        
+        raid_selection = st.selectbox(
+            "Raid",
+            list(RAID_FILES.keys()),
+            index=list(RAID_FILES.keys()).index(current_display),
+            key="raid_selector",
+            label_visibility="collapsed",
+            help="Select which raid configuration to use"
+        )
+        
+        # Update selected raid file if changed
+        new_raid_file = RAID_FILES[raid_selection]
+        if new_raid_file != st.session_state.get("selected_raid_file"):
+            st.session_state["selected_raid_file"] = new_raid_file
+            # Clear boss blocks when switching raids
+            st.session_state.pop("boss_blocks", None)
+            st.session_state.pop("next_boss_block_id", None)
+            st.rerun()
+        
+        # Reload configuration for current raid
+        ability_names, boss_options = _reload_boss_config()
+        
+        _init_boss_blocks()
+
+        st.markdown("---")
 
         # ------------------------------------------------------------------
         # Guild URL + ignore-after-deaths
@@ -114,7 +170,17 @@ def render_input_settings() -> Tuple[
         # Date range
         # ------------------------------------------------------------------
         today = datetime.now(timezone.utc).date()
-        default_start = today - timedelta(days=7)
+        # Default to ~6 months back, roughly how long a raid tier lasts.
+        month = today.month - 6
+        year = today.year
+        if month <= 0:
+            month += 12
+            year -= 1
+        try:
+            default_start = today.replace(year=year, month=month)
+        except ValueError:
+            # Day-of-month doesn't exist in the target month (e.g. 31st).
+            default_start = today.replace(year=year, month=month, day=1)
         default_end = today
 
         col1, col2 = st.columns(2)
@@ -148,15 +214,15 @@ def render_input_settings() -> Tuple[
             cols = st.columns([3, 1])
 
             with cols[0]:
-                all_boss_names = list(BOSS_OPTIONS.keys())
+                all_boss_names = list(boss_options.keys())
                 if not all_boss_names:
-                    st.error("No bosses configured in bosses.json.")
+                    st.error(f"No bosses configured in {_get_current_raid_file()}.")
                     continue
 
                 used_by_others = {
                     b.get("boss_name")
                     for b in boss_blocks
-                    if b["id"] != block["id"] and b.get("boss_name") in BOSS_OPTIONS
+                    if b["id"] != block["id"] and b.get("boss_name") in boss_options
                 }
 
                 current_boss_name = block.get("boss_name")
@@ -191,7 +257,7 @@ def render_input_settings() -> Tuple[
                         use_container_width=True,
                     )
 
-            boss_info = BOSS_OPTIONS[boss_name]
+            boss_info = boss_options[boss_name]
             boss_ability_ids = boss_info["abilities"]
 
             # If this boss has zero abilities, show a message and skip multiselect
@@ -211,19 +277,17 @@ def render_input_settings() -> Tuple[
             ]
 
             ability_options = [
-                f"{ability_id} ({ABILITY_NAMES.get(ability_id, 'Unknown')})"
+                f"{ability_id} ({ability_names.get(ability_id, 'Unknown')})"
                 for ability_id in boss_ability_ids
             ]
             default_labels = [
-                f"{ability_id} ({ABILITY_NAMES.get(ability_id, 'Unknown')})"
+                f"{ability_id} ({ability_names.get(ability_id, 'Unknown')})"
                 for ability_id in prev_selected_ids
             ]
 
             state_key = f"abilities_{block['id']}"
 
             # If the widget has stale state that doesn't match any option, drop it.
-            # IMPORTANT: we never assign to st.session_state[state_key] here,
-            # we only pop it to avoid the Streamlit warning.
             if state_key in st.session_state:
                 current_val = st.session_state[state_key]
                 if isinstance(current_val, (list, tuple)):
@@ -242,7 +306,6 @@ def render_input_settings() -> Tuple[
                     "If none are selected, all deaths for this boss are counted."
                 ),
             )
-
 
             # Convert labels back to numeric IDs
             selected_ids: List[int] = []
@@ -270,14 +333,14 @@ def render_input_settings() -> Tuple[
             else:
                 next_id = st.session_state["next_boss_block_id"]
 
-            all_boss_names = list(BOSS_OPTIONS.keys())
+            all_boss_names = list(boss_options.keys())
             if not all_boss_names:
                 return
 
             used_bosses = {
                 b.get("boss_name")
                 for b in st.session_state["boss_blocks"]
-                if b.get("boss_name") in BOSS_OPTIONS
+                if b.get("boss_name") in boss_options
             }
 
             default_boss_name = next(
@@ -316,21 +379,19 @@ def render_input_settings() -> Tuple[
         # ------------------------------------------------------------------
         # Inline "Add ability to boss configuration" form
         # ------------------------------------------------------------------
-        # ------------------------------------------------------------------
-        # Inline "Add ability to boss configuration" form
-        # ------------------------------------------------------------------
         if st.session_state.get("show_add_ability_form", False):
             st.markdown("---")
             st.markdown("### Add ability to boss configuration")
+            st.info(f"Adding to: **{raid_selection}**")
 
-            boss_names = list(BOSS_OPTIONS.keys())
+            boss_names = list(boss_options.keys())
             if boss_names:
                 selected_boss_for_new = st.selectbox(
                     "Boss",
                     boss_names,
                     key="add_ability_boss",
                 )
-                boss_info = BOSS_OPTIONS[selected_boss_for_new]
+                boss_info = boss_options[selected_boss_for_new]
 
                 ability_id_str = st.text_input(
                     "Ability ID (numeric, from Warcraft Logs)",
@@ -362,23 +423,15 @@ def render_input_settings() -> Tuple[
                                 # Use custom label if given, otherwise WCL name
                                 label = custom_label.strip() or api_name
 
-                                # Persist to bosses.json
+                                # Persist to the selected raid JSON file
+                                raid_file = _get_current_raid_file()
                                 boss_config.add_ability(
                                     boss_name=selected_boss_for_new,
                                     boss_id=boss_info["id"],
                                     ability_id=ability_id,
                                     label=label,
+                                    raid_file=raid_file,
                                 )
-
-                                # Update in-memory structures so it works immediately
-                                ABILITY_NAMES[ability_id] = label
-                                if (
-                                    ability_id
-                                    not in BOSS_OPTIONS[selected_boss_for_new]["abilities"]
-                                ):
-                                    BOSS_OPTIONS[selected_boss_for_new][
-                                        "abilities"
-                                    ].append(ability_id)
 
                                 # Clear any stale ability selections so UI refreshes cleanly
                                 for k in list(st.session_state.keys()):
@@ -387,13 +440,13 @@ def render_input_settings() -> Tuple[
 
                                 # Hide form and rerun to refresh boss block UI
                                 st.session_state["show_add_ability_form"] = False
+                                st.success(f"Added ability {ability_id} to {selected_boss_for_new} in {raid_selection}")
                                 try:
                                     st.rerun()
                                 except AttributeError:
                                     st.experimental_rerun()
             else:
-                st.warning("No bosses configured in bosses.json; cannot add abilities.")
-
+                st.warning(f"No bosses configured in {raid_selection}; cannot add abilities.")
 
         # ------------------------------------------------------------------
         # Generate button
@@ -406,7 +459,7 @@ def render_input_settings() -> Tuple[
                 use_container_width=True,
             )
 
-    targets = _build_targets_from_blocks(st.session_state.get("boss_blocks", []))
+    targets = _build_targets_from_blocks(st.session_state.get("boss_blocks", []), boss_options)
 
     # 0 or empty should behave as "null" – i.e. no cutoff.
     if ignore_after_player_deaths_raw and ignore_after_player_deaths_raw > 0:

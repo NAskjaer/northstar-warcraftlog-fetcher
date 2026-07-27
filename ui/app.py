@@ -15,18 +15,19 @@ from src.calendar_fetcher import fetch_logs_for_guild
 from src.deaths_fetcher import (
     get_deaths_by_player_for_ability,
     get_boss_fights_for_report,
+    _fetch_player_actors,
 )
 from src.damage_taken_fetcher import get_damage_taken_by_player_for_ability
-
-
+from src.survivability_fetcher import compute_survivability_for_report
+from src import boss_config
 
 from sections.env_section import render_env_section
 from sections.input_settings import (
     render_input_settings,
-    ABILITY_NAMES,
     DIFFICULTY,
 )
 from sections.results_section import render_results
+
 
 # --------------------------------------------------------------------
 # Paths / env bootstrap
@@ -78,6 +79,11 @@ guild_url, start_date, end_date, targets, ignore_after_player_deaths, submitted 
     render_input_settings()
 )
 
+# Get current raid file for ability name lookups
+if "selected_raid_file" not in st.session_state:
+    st.session_state["selected_raid_file"] = "Midnight_season_1.json"
+current_raid_file = st.session_state["selected_raid_file"]
+
 # Parse guild id (only once; error out if bad)
 try:
     parts = guild_url.strip("/").split("/")
@@ -115,7 +121,6 @@ metric_mode = st.radio(
     index=0,
     horizontal=True,   # 👈 makes the radio buttons line up horizontally
 )
-
 
 show_deaths = metric_mode in ("Deaths", "Both")
 show_damage = metric_mode in ("Damage taken", "Both")
@@ -224,179 +229,250 @@ def compute_and_cache_results(
                     boss_id=boss_id,
                     ability_id=ability_id,
                     difficulty=DIFFICULTY,
+                    wipes_only=True,
                     ignore_after_player_deaths=ignore_after_player_deaths,
                 )
-                value_key = "total_deaths"
-                player_hits: dict[str, int] = {}
-                total_hits = 0
             else:
+                # Damage-taken mode
                 rows = get_damage_taken_by_player_for_ability(
                     report_code=code,
                     boss_id=boss_id,
                     ability_id=ability_id,
                     difficulty=DIFFICULTY,
+                    wipes_only=True,
                     ignore_after_player_deaths=ignore_after_player_deaths,
                 )
-                value_key = "total_damage"
-                # damage fetcher already returns hits per row
-                player_hits = {
-                    row["player"]: row.get("hits", 0) for row in rows
-                }
-                total_hits = sum(player_hits.values())
-        except RuntimeError:
-            rows = []
-            value_key = "total_deaths" if metric_is_deaths else "total_damage"
-            player_hits = {}
-            total_hits = 0
+        except Exception as exc:
+            return {
+                "error": str(exc),
+                "target_index": target_index,
+                "date_str": date_str,
+                "code": code,
+            }
 
-        # 2) Build per-player values for this report
-        player_counts = {
-            row["player"]: row.get(value_key, 0) for row in rows
-        }
-        total_deaths = sum(player_counts.values())
+        # 2) Build per-player dict
+        player_counts = {}
+        player_hits = {}
+        for r in rows:
+            pname = r.get("player", "Unknown")
+            if metric_is_deaths:
+                player_counts[pname] = int(r.get("total_deaths", 0))
+            else:
+                player_counts[pname] = int(r.get("total_damage", 0))
+                player_hits[pname] = int(r.get("hits", 0))
 
-        # 3) Count pulls for this boss in this report
+        # 3) If no hits, skip
+        if not player_counts:
+            return {
+                "target_index": target_index,
+                "date_str": date_str,
+                "code": code,
+                "no_data": True,
+            }
+
+        # 4) Fetch fights for that (boss, date)
+        # ...
         try:
             fights = get_boss_fights_for_report(
                 report_code=code,
                 boss_id=boss_id,
                 difficulty=DIFFICULTY,
             )
-            num_pulls = len(fights)
-        except RuntimeError:
-            num_pulls = 0
+            wipes = [f for f in fights if not f.get("kill", False)]
+        except Exception:
+            wipes = []
+
+        # 5) Per-player pull (attendance) counts across the wipe fights,
+        #    using each fight's friendlyPlayers roster mapped to names.
+        player_pulls: dict[str, int] = {}
+        if wipes:
+            try:
+                actors_map = _fetch_player_actors(code)
+                for f in wipes:
+                    for actor_id in f.get("friendlyPlayers") or []:
+                        name = actors_map.get(int(actor_id))
+                        if name:
+                            player_pulls[name] = player_pulls.get(name, 0) + 1
+            except Exception:
+                player_pulls = {}
 
         return {
+            "target_index": target_index,
             "date_str": date_str,
             "code": code,
-            "target_index": target_index,
-            "total_deaths": total_deaths,
             "player_counts": player_counts,
-            "boss_id": boss_id,
-            "ability_id": ability_id,
-            "num_pulls": num_pulls,
             "player_hits": player_hits,
-            "total_hits": total_hits,
+            "num_pulls": len(wipes),
+            "player_pulls": player_pulls,
         }
 
     # --- Run jobs in parallel -------------------------------------------
-    max_workers = 8
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    completed = 0
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(process_job, j): j for j in jobs}
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(process_job, job) for job in jobs]
+        for future in as_completed(futures):
+            completed += 1
+            progress_pct = completed / total_jobs if total_jobs > 0 else 1.0
+            progress_bar.progress(progress_pct)
+            status_area.caption(
+                f"Processed {completed}/{total_jobs} report-ability pairs…"
+            )
 
-        for i, future in enumerate(as_completed(futures), start=1):
             result = future.result()
 
-            code = result["code"]
-            date_str = result["date_str"]
-            target_index = result["target_index"]
-            total_deaths = result["total_deaths"]
-            player_counts = result["player_counts"]
-            boss_id = result["boss_id"]
-            ability_id = result["ability_id"]
-            num_pulls = result["num_pulls"]
-            player_hits = result.get("player_hits") or {}
-            total_hits = result.get("total_hits", 0)
+            # Check for error
+            if "error" in result:
+                continue  # skip this job
 
-            ability_label = "All abilities" if ability_id is None else str(ability_id)
-            status_area.write(
-                f"Processed {i}/{total_jobs} jobs "
-                f"(report={code}, boss_id={boss_id}, ability={ability_label})."
-            )
-            progress_bar.progress(i / total_jobs)
-
-            if num_pulls == 0:
+            # Check for no-data
+            if result.get("no_data"):
                 continue
 
+            # Store
+            target_index = result["target_index"]
+            date_str = result["date_str"]
+            code = result["code"]
+            player_counts = result["player_counts"]
+            player_hits = result["player_hits"]
+            num_pulls = result["num_pulls"]
+            player_pulls = result.get("player_pulls", {})
+
             key = (target_index, date_str)
-            existing = meta_by_target_date.get(key)
-            if existing is None or total_deaths > existing["total_deaths"]:
-                meta_by_target_date[key] = {
-                    "code": code,
-                    "total_deaths": total_deaths,
-                    "player_counts": player_counts,
-                    "num_pulls": num_pulls,
-                    "player_hits": player_hits,
-                    "total_hits": total_hits,
-                }
-                all_players.update(player_counts.keys())
+            meta_by_target_date[key] = {
+                "code": code,
+                "player_counts": player_counts,
+                "player_hits": player_hits,
+                "num_pulls": num_pulls,
+                "player_pulls": player_pulls,
+            }
+            all_players.update(player_counts.keys())
 
-    status_area.empty()
     progress_bar.empty()
+    status_area.empty()
 
+    # If reports were found but none contained fights for the selected
+    # boss(es)/ability, make that explicit instead of silently showing an
+    # empty result (which reads like the app failed to generate anything).
     if not meta_by_target_date:
-        msg = (
-            "No deaths found for the selected bosses/abilities in this date range."
-            if metric_is_deaths
-            else "No damage taken found for the selected bosses/abilities "
-                 "in this date range."
+        st.warning(
+            f"Fetched {len(best_reports_per_date)} report(s) in this date range, "
+            f"but found no **{metric_label}** data for the selected boss(es)/"
+            "ability at Mythic difficulty. Likely causes: the boss wasn't pulled "
+            "in these logs, the ability ID doesn't match, or the encounter isn't "
+            "available on Warcraft Logs yet (e.g. an unreleased raid)."
         )
-        st.warning(msg)
         st.session_state["results_cache"][cache_key] = None
         return
 
-    # ----------------------------------------------------------------
-    # Build one matrix-style table per target (boss + ability)
-    # ----------------------------------------------------------------
-    per_target_entries: dict[
-        int, list[tuple[str, str, dict[str, int], int, dict[str, int]]]
-    ] = {}
-    for (target_index, date_str), info in meta_by_target_date.items():
-        per_target_entries.setdefault(target_index, []).append(
-            (
-                date_str,
-                info["code"],
-                info["player_counts"],
-                info.get("num_pulls", 0),
-                info.get("player_hits", {}),
-            )
-        )
+    # --- Survivability (deaths-only) ------------------------------------------------
+    survivability_final: dict[int, dict[str, object]] | None = None
+    if metric_is_deaths:
+        survivability_final = {}
+        surv_keys = {k for k, v in meta_by_target_date.items() if "player_counts" in v}
 
+        for target_index, tgt in enumerate(targets):
+            boss_id = tgt["boss_id"]
+
+            boss_keys = {
+                k for k in surv_keys if k[0] == target_index
+            }
+
+            # Use only first date per target
+            if boss_keys:
+                first_boss_key = sorted(boss_keys, key=lambda x: x[1])[0]
+                date_str = first_boss_key[1]
+                code = meta_by_target_date[first_boss_key]["code"]
+
+                try:
+                    surv_data = compute_survivability_for_report(
+                        report_code=code,
+                        boss_id=boss_id,
+                        difficulty=DIFFICULTY,
+                    )
+                    survivability_final[target_index] = {
+                        "date_str": date_str,
+                        "code": code,
+                        "data": surv_data,
+                    }
+                except Exception:
+                    pass
+
+    # --- Build tables ---------------------------------------------------------------
     tables: dict[int, dict[str, object]] = {}
 
-    for target_index, entries in per_target_entries.items():
-        # Sort days for this target
-        entries.sort(key=lambda tup: tup[0])
+    # Load ability names for current raid
+    ability_names = boss_config.get_ability_names(current_raid_file)
 
-        # Raw ISO date strings and pulls per date
-        date_columns = [date for (date, _code, _counts, _pulls, _hits) in entries]
-        pulls_per_date = {
-            date: pulls for (date, _code, _counts, pulls, _hits) in entries
-        }
-        total_pulls = sum(pulls_per_date.values())
+    for target_index, _target in enumerate(targets):
+        # Collect all entries for this target
+        relevant_entries = [
+            (k, v)
+            for k, v in meta_by_target_date.items()
+            if k[0] == target_index and "player_counts" in v
+        ]
+        if not relevant_entries:
+            continue
 
-        # Build nice DD/MM labels with pulls
-        from datetime import datetime as _dt
+        # Sort by date
+        relevant_entries.sort(key=lambda x: x[0][1])
 
+        entries: list[
+            tuple[str, str, dict[str, int], int, dict[str, int], dict[str, int]]
+        ] = []
+        date_columns: list[str] = []
         friendly_date_labels: list[str] = []
-        for date in date_columns:
-            dt = _dt.strptime(date, "%Y-%m-%d").date()
-            base = dt.strftime("%d/%m")
-            pulls = pulls_per_date.get(date, 0)
-            if pulls > 0:
-                label = f"{base} ({pulls} pulls)"
-            else:
-                label = base
-            friendly_date_labels.append(label)
 
-        base_total_label = (
-            "Total Deaths" if metric_is_deaths else "Total Damage Taken"
+        for (_tgt_idx, date_str), data in relevant_entries:
+            code = data["code"]
+            player_counts = data["player_counts"]
+            pulls = data["num_pulls"]
+            player_hits = data["player_hits"]
+            player_pulls = data.get("player_pulls", {})
+
+            entries.append(
+                (date_str, code, player_counts, pulls, player_hits, player_pulls)
+            )
+            date_columns.append(date_str)
+
+            # Make a friendlier label
+            if pulls:
+                friendly_label = f"{date_str} ({pulls}p)"
+            else:
+                friendly_label = date_str
+
+            friendly_date_labels.append(friendly_label)
+
+        total_pulls = sum(
+            pulls for (_date, _code, _counts, pulls, _hits, _ppulls) in entries
         )
+        if metric_is_deaths:
+            base_total_label = "Total Deaths"
+        else:
+            base_total_label = "Total Damage Taken"
+
+        # Optionally append total pull count
+        if total_pulls <= 0:
+            entries = [
+                (date_str, code, counts, 0, hits, ppulls)
+                for date_str, code, counts, _pulls, hits, ppulls in entries
+            ]
         total_col_label = base_total_label
         if total_pulls > 0:
             total_col_label = f"{base_total_label} ({total_pulls} pulls)"
 
-        report_codes = [code for (_date, code, _counts, _pulls, _hits) in entries]
+        report_codes = [
+            code for (_date, code, _counts, _pulls, _hits, _ppulls) in entries
+        ]
 
-        # Build per-report player counts and totals
         per_report_counts: dict[str, dict[str, int]] = {}
         per_report_hits: dict[str, dict[str, int]] = {}
+        per_report_pulls: dict[str, dict[str, int]] = {}
         players_for_target: set[str] = set()
 
-        for date_str, code, player_counts, _pulls, player_hits in entries:
+        for date_str, code, player_counts, _pulls, player_hits, player_pulls in entries:
             per_report_counts[code] = player_counts
+            per_report_pulls[code] = player_pulls
             if not metric_is_deaths:
                 per_report_hits[code] = player_hits
             players_for_target.update(player_counts.keys())
@@ -407,6 +483,14 @@ def compute_and_cache_results(
             for code in report_codes:
                 total += per_report_counts.get(code, {}).get(player, 0)
             player_totals[player] = total
+
+        # Per-player pull (attendance) totals across all report-days shown.
+        player_pull_totals: dict[str, int] = {}
+        for player in players_for_target:
+            player_pull_totals[player] = sum(
+                per_report_pulls.get(code, {}).get(player, 0)
+                for code in report_codes
+            )
 
         sorted_players = sorted(
             players_for_target,
@@ -419,7 +503,7 @@ def compute_and_cache_results(
             rows_for_display: list[list[object]] = []
             for player in sorted_players:
                 row = [player, player_totals[player]]
-                for _date, code, _counts, _pulls, _hits in entries:
+                for _date, code, _counts, _pulls, _hits, _ppulls in entries:
                     val = per_report_counts.get(code, {}).get(player, 0)
                     row.append(val)
                 rows_for_display.append(row)
@@ -458,7 +542,7 @@ def compute_and_cache_results(
                     player_totals[player],
                     player_totals_hits.get(player, 0),
                 ]
-                for _date, code, _counts, _pulls, _hits in entries:
+                for _date, code, _counts, _pulls, _hits, _ppulls in entries:
                     dmg = per_report_counts.get(code, {}).get(player, 0)
                     hits = per_report_hits.get(code, {}).get(player, 0)
                     row.append(dmg)
@@ -479,17 +563,25 @@ def compute_and_cache_results(
 
             df_display = df_display.rename(columns=rename_map)
 
-        # CSV header with boss / ability label
+        # Embed each player's pull (attendance) count into the display name,
+        # e.g. "Jonach (Pulls: 158)". The raw `df` keeps plain names so the
+        # boss-summary view can still group by player.
+        df_display["Player"] = df_display["Player"].map(
+            lambda name: f"{name} (Pulls: {player_pull_totals.get(name, 0)})"
+        )
+
+        # Human labels
         target = targets[target_index]
         boss_label = target["boss_name"]
         ability_id = target["ability_id"]
         if ability_id is not None:
             ability_display = (
-                f"{ability_id} ({ABILITY_NAMES.get(ability_id, 'Unknown')})"
+                f"{ability_id} ({ability_names.get(ability_id, 'Unknown')})"
             )
         else:
             ability_display = "All abilities"
 
+        # Build CSV for this table
         csv_buffer = io.StringIO()
         writer = csv.writer(csv_buffer)
         writer.writerow([boss_label, ability_display])
@@ -498,25 +590,29 @@ def compute_and_cache_results(
             writer.writerow(r)
         csv_bytes = csv_buffer.getvalue().encode("utf-8")
 
-        # Build per-column log metadata (for links in the UI)
-        # friendly_date_labels and report_codes are in the same order
+        # Log links used for this table
         log_links = [
             {"label": label, "report_code": code}
             for label, code in zip(friendly_date_labels, report_codes)
         ]
 
         tables[target_index] = {
-            "df": df,                    # raw (used for boss summary)
-            "df_display": df_display,    # pretty (for single-ability view)
+            "df": df,
+            "df_display": df_display,
             "csv_bytes": csv_bytes,
-            "log_links": log_links,      # <--- NEW: log metadata
+            "log_links": log_links,
+            "player_pulls": player_pull_totals,
         }
 
+        # Update global list of logs for this run
+        global_logs = st.session_state.setdefault("log_links_global", [])
+        for entry in log_links:
+            if entry not in global_logs:
+                global_logs.append(entry)
 
     num_reports = len({info["code"] for info in meta_by_target_date.values()})
     num_players = len(all_players)
 
-    # Build mapping boss_id -> list of target indices (for boss summary view)
     boss_to_targets: dict[int, list[int]] = {}
     for idx, tgt in enumerate(targets):
         boss_to_targets.setdefault(tgt["boss_id"], []).append(idx)
@@ -529,14 +625,21 @@ def compute_and_cache_results(
     )
 
     # Store everything needed to re-render without recomputing
-    st.session_state["results_cache"][cache_key] = {
+    cache_entry = {
         "tables": tables,
         "targets": targets,
         "num_reports": num_reports,
         "num_players": num_players,
         "boss_to_targets": boss_to_targets,
+        "raid_file": current_raid_file,  # Store the raid file used
     }
+    if metric_is_deaths:
+        cache_entry["survivability"] = survivability_final
 
+    if "results_cache" not in st.session_state:
+        st.session_state["results_cache"] = {}
+
+    st.session_state["results_cache"][cache_key] = cache_entry
 
 def render_from_cache(
     *,
@@ -552,8 +655,6 @@ def render_from_cache(
         st.info("No results for this metric yet. Click **Generate CSV** above.")
         return
 
-    from sections.results_section import render_results
-
     render_results(
         cache["tables"],
         cache["targets"],
@@ -561,6 +662,7 @@ def render_from_cache(
         cache["num_players"],
         cache["boss_to_targets"],
         metric_is_deaths,
+        cache.get("raid_file", "Midnight_season_1.json"),  # Get raid file from cache
         key_prefix=key_prefix,
         section_title=section_title,
     )
