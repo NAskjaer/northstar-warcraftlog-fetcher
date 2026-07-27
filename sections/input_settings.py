@@ -15,7 +15,6 @@ RAID_FILES = {
     "Midnight Season 1": "Midnight_season_1.json"
 }
 
-
 def _get_current_raid_file() -> str:
     """Get the currently selected raid file."""
     if "selected_raid_file" not in st.session_state:
@@ -90,6 +89,22 @@ def _build_targets_from_blocks(
     return targets
 
 
+def _render_ignore_input() -> int:
+    """Render the shared 'Ignore events after player deaths' number input."""
+    return st.number_input(
+        "Ignore events after player deaths",
+        min_value=0,
+        step=1,
+        value=0,
+        help=(
+            "Matches Warcraft Logs' 'Ignore Events After Player Deaths' option. "
+            "If set to N > 0, events after the Nth player death in a pull "
+            "are ignored. If set to 0, all events are counted."
+        ),
+        key="ignore_after_player_deaths",
+    )
+
+
 def render_input_settings() -> Tuple[
     str,
     date_cls,
@@ -97,8 +112,17 @@ def render_input_settings() -> Tuple[
     List[Dict[str, Any]],
     int | None,
     bool,
+    Dict[str, Any],
 ]:
-    """Render the '2. Input settings' section and return user choices."""
+    """Render the '2. Input settings' section and return user choices.
+
+    The final element is a ``source_settings`` dict describing where guilds
+    come from::
+
+        {"mode": "single" | "ranking",
+         "rank_start": int,
+         "rank_end": int}
+    """
 
     with st.expander("2. Input settings", expanded=True):
         st.markdown("Configure which logs to analyze and how to group deaths.")
@@ -141,46 +165,117 @@ def render_input_settings() -> Tuple[
         st.markdown("---")
 
         # ------------------------------------------------------------------
-        # Guild URL + ignore-after-deaths
+        # Data source: single guild vs top guilds by world ranking
         # ------------------------------------------------------------------
-        col_url, col_ignore = st.columns([2, 1])
+        source_mode = st.radio(
+            "Guild source",
+            options=["Single guild (URL)", "Top guilds (world ranking)"],
+            index=0,
+            horizontal=True,
+            key="guild_source_mode",
+            help=(
+                "Analyze one guild by URL, or aggregate the top guilds for the "
+                "selected boss using Warcraft Logs' public rankings."
+            ),
+        )
+        source_is_ranking = source_mode.startswith("Top guilds")
 
-        with col_url:
-            guild_url = st.text_input(
-                "Guild URL",
-                placeholder="https://www.warcraftlogs.com/guild/id/235490",
-                help="Full Warcraft Logs guild URL. The app extracts the guild ID from this.",
+        # Defaults; overwritten below depending on mode.
+        guild_url = ""
+        rank_start = 1
+        rank_end = 50
+        min_attendance_frac: float | None = None
+
+        if not source_is_ranking:
+            col_url, col_ignore = st.columns([2, 1])
+            with col_url:
+                guild_url = st.text_input(
+                    "Guild URL",
+                    placeholder="https://www.warcraftlogs.com/guild/id/235490",
+                    help="Full Warcraft Logs guild URL. The app extracts the guild ID from this.",
+                )
+            with col_ignore:
+                ignore_after_player_deaths_raw = _render_ignore_input()
+        else:
+            st.markdown(
+                "Guilds come from a stored world-progress ranking for this "
+                "raid. Set the rank range below and go."
             )
 
-        with col_ignore:
-            ignore_after_player_deaths_raw = st.number_input(
-                "Ignore events after player deaths",
-                min_value=0,
-                step=1,
-                value=0,
-                help=(
-                    "Matches Warcraft Logs' 'Ignore Events After Player Deaths' option. "
-                    "If set to N > 0, events after the Nth player death in a pull "
-                    "are ignored. If set to 0, all events are counted."
-                ),
-                key="ignore_after_player_deaths",
+            col_start, col_end, col_ignore = st.columns([1, 1, 1])
+            with col_start:
+                rank_start = int(
+                    st.number_input(
+                        "Rank from",
+                        min_value=1,
+                        step=1,
+                        value=1,
+                        key="ranking_rank_start",
+                        help="Keep only guilds with world rank ≥ this.",
+                    )
+                )
+            with col_end:
+                rank_end = int(
+                    st.number_input(
+                        "Rank to",
+                        min_value=1,
+                        step=1,
+                        value=50,
+                        key="ranking_rank_end",
+                        help="Keep only guilds with world rank ≤ this.",
+                    )
+                )
+            with col_ignore:
+                ignore_after_player_deaths_raw = _render_ignore_input()
+
+            if rank_end < rank_start:
+                rank_start, rank_end = rank_end, rank_start
+            _n_guilds = rank_end - rank_start + 1
+            st.caption(
+                f"From the stored ranking, analyze guilds ranked "
+                f"**{rank_start}–{rank_end}** over the date range above. Each "
+                "guild's pull count comes from its logs in that range, so pick a "
+                "range that covers the progression. "
+                f"⏱️ Roughly ~{max(1, _n_guilds * 15 // 60)}–"
+                f"{max(1, _n_guilds * 25 // 60)} min for {_n_guilds} guilds; "
+                "large ranges are slower and may hit Warcraft Logs rate limits."
+            )
+
+            col_filt, col_pct = st.columns([2, 1])
+            with col_filt:
+                attendance_filter_on = st.checkbox(
+                    "Only players with high attendance",
+                    value=True,
+                    key="ranking_attendance_filter",
+                    help=(
+                        "Drop players who attended fewer than the chosen "
+                        "percentage of their guild's pulls-for-kill (wipe pulls "
+                        "in the analysed report). Prevents low-attendance "
+                        "players from looking 'clean' just for sitting out."
+                    ),
+                )
+            with col_pct:
+                attendance_pct = int(
+                    st.number_input(
+                        "Min attendance %",
+                        min_value=1,
+                        max_value=100,
+                        step=5,
+                        value=80,
+                        key="ranking_attendance_pct",
+                        disabled=not attendance_filter_on,
+                    )
+                )
+            min_attendance_frac = (
+                attendance_pct / 100.0 if attendance_filter_on else None
             )
 
         # ------------------------------------------------------------------
         # Date range
         # ------------------------------------------------------------------
         today = datetime.now(timezone.utc).date()
-        # Default to ~6 months back, roughly how long a raid tier lasts.
-        month = today.month - 6
-        year = today.year
-        if month <= 0:
-            month += 12
-            year -= 1
-        try:
-            default_start = today.replace(year=year, month=month)
-        except ValueError:
-            # Day-of-month doesn't exist in the target month (e.g. 31st).
-            default_start = today.replace(year=year, month=month, day=1)
+        # Default to the Midnight Season 1 start; covers the whole tier.
+        default_start = date_cls(2026, 3, 31)
         default_end = today
 
         col1, col2 = st.columns(2)
@@ -467,6 +562,13 @@ def render_input_settings() -> Tuple[
     else:
         ignore_after_player_deaths = None
 
+    source_settings: Dict[str, Any] = {
+        "mode": "ranking" if source_is_ranking else "single",
+        "rank_start": rank_start,
+        "rank_end": rank_end,
+        "min_attendance_frac": min_attendance_frac,
+    }
+
     return (
         guild_url,
         start_date,
@@ -474,4 +576,5 @@ def render_input_settings() -> Tuple[
         targets,
         ignore_after_player_deaths,
         submitted,
+        source_settings,
     )

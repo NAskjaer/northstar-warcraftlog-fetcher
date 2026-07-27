@@ -19,6 +19,10 @@ from src.deaths_fetcher import (
 )
 from src.damage_taken_fetcher import get_damage_taken_by_player_for_ability
 from src.survivability_fetcher import compute_survivability_for_report
+from src.api_client import get_rate_limit
+from src.guild_rankings_fetcher import get_encounter_zone_id
+from src.guild_rankings_store import load_ranking
+from src.multi_guild import aggregate_guilds, reset_report_caches
 from src import boss_config
 
 from sections.env_section import render_env_section
@@ -73,32 +77,85 @@ if not env_ok:
 
 
 # ====================================================================
+# API rate-limit indicator (same numbers as warcraftlogs.com/profile).
+# On-demand: reading it costs 1 point, so only refresh when clicked.
+# ====================================================================
+def _render_rate_limit() -> None:
+    with st.expander("Warcraft Logs API rate limit", expanded=False):
+        if st.button("Check rate limit", key="check_rate_limit"):
+            try:
+                st.session_state["rate_limit"] = get_rate_limit()
+            except Exception as exc:  # already throttled / network error
+                st.session_state["rate_limit"] = {"error": str(exc)}
+
+        rl = st.session_state.get("rate_limit")
+        if rl is None:
+            st.caption("Click **Check rate limit** to see your current usage.")
+            return
+        if "error" in rl:
+            st.warning(
+                "Couldn't read the rate limit (you may already be throttled): "
+                f"{rl['error']}"
+            )
+            return
+
+        limit = rl["limit_per_hour"]
+        spent = rl["points_spent"]
+        remaining = max(0.0, limit - spent)
+        mins = max(1, rl["points_reset_in"] // 60)
+        pct_used = (spent / limit * 100) if limit else 0
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Points remaining", f"{int(remaining):,}")
+        c2.metric("Hourly limit", f"{limit:,}")
+        c3.metric("Resets in", f"~{mins} min")
+        st.progress(min(1.0, pct_used / 100))
+        st.caption(
+            f"{int(spent):,} of {limit:,} points used this hour "
+            f"({pct_used:.0f}%). Window resets in ~{mins} min."
+        )
+
+
+_render_rate_limit()
+
+
+# ====================================================================
 # 2. Input settings section (delegated to sections/input_settings.py)
 # ====================================================================
-guild_url, start_date, end_date, targets, ignore_after_player_deaths, submitted = (
-    render_input_settings()
-)
+(
+    guild_url,
+    start_date,
+    end_date,
+    targets,
+    ignore_after_player_deaths,
+    submitted,
+    source_settings,
+) = render_input_settings()
 
 # Get current raid file for ability name lookups
 if "selected_raid_file" not in st.session_state:
     st.session_state["selected_raid_file"] = "Midnight_season_1.json"
 current_raid_file = st.session_state["selected_raid_file"]
 
-# Parse guild id (only once; error out if bad)
-try:
-    parts = guild_url.strip("/").split("/")
-    idx = parts.index("id") + 1
-    guild_id = int(parts[idx])
-except Exception:
-    if submitted:
-        st.error(
-            "Could not parse guild ID from URL. "
-            "Expected something like https://www.warcraftlogs.com/guild/id/235490"
-        )
-    # If URL is bad and we have no previous result, nothing to show
-    if not st.session_state["analysis_cache"]:
-        st.stop()
-    guild_id = None  # will not be used when we load from cache
+source_mode = source_settings.get("mode", "single")
+
+# Parse guild id (single-guild mode only; ranking mode sources guilds from
+# the rankings API and does not use a guild URL).
+guild_id: int | None = None
+if source_mode == "single":
+    try:
+        parts = guild_url.strip("/").split("/")
+        idx = parts.index("id") + 1
+        guild_id = int(parts[idx])
+    except Exception:
+        if submitted:
+            st.error(
+                "Could not parse guild ID from URL. "
+                "Expected something like https://www.warcraftlogs.com/guild/id/235490"
+            )
+        # If URL is bad and we have no previous result, nothing to show
+        if not st.session_state["analysis_cache"]:
+            st.stop()
+        guild_id = None  # will not be used when we load from cache
 
 # Convert date range to UTC datetimes
 start_dt = datetime(
@@ -128,6 +185,270 @@ show_damage = metric_mode in ("Damage taken", "Both")
 # Initialise per-metric results cache
 if "results_cache" not in st.session_state:
     st.session_state["results_cache"] = {"deaths": None, "damage": None}
+
+
+# ====================================================================
+# Top-guilds (world ranking) mode
+# ====================================================================
+def _ability_label(ability_id, ability_names) -> str:
+    if ability_id is None:
+        return "All abilities"
+    return f"{ability_id} ({ability_names.get(ability_id, 'Unknown')})"
+
+
+def _build_multi_guild_table(rows, metric_is_deaths):
+    """Turn merged per-player rows into (df_display, csv-ready df)."""
+    if metric_is_deaths:
+        columns = ["Player", "Guild", "Total Deaths", "Pulls", "Guild Pulls"]
+        data = [
+            [r["player"], r["guild"], r["value"], r["pulls"], r.get("pulls_for_kill", 0)]
+            for r in rows
+        ]
+    else:
+        columns = [
+            "Player", "Guild", "Total Damage Taken", "Hits", "Pulls", "Guild Pulls"
+        ]
+        data = [
+            [
+                r["player"],
+                r["guild"],
+                r["value"],
+                r.get("hits", 0),
+                r["pulls"],
+                r.get("pulls_for_kill", 0),
+            ]
+            for r in rows
+        ]
+    return pd.DataFrame(data, columns=columns)
+
+
+def compute_multi_guild_cache() -> None:
+    """Fetch top guilds and aggregate players for each target + metric."""
+    if not targets:
+        st.error("Please configure at least one boss to analyze.")
+        st.session_state["multi_guild_cache"] = None
+        return
+
+    # Fresh caches per run so fights/actors/death-events fetched for one
+    # metric or ability are reused by the others instead of re-queried.
+    reset_report_caches()
+
+    rank_start = source_settings["rank_start"]
+    rank_end = source_settings["rank_end"]
+
+    # Guilds come from the stored progress ranking (the true world-progress
+    # order), which costs ZERO API calls. Slice it to the requested rank range.
+    all_ranked = load_ranking(current_raid_file)
+
+    if not all_ranked:
+        st.error(
+            f"No stored ranking for this raid yet. Add one at "
+            f"config/guild_rankings/{current_raid_file}."
+        )
+        st.session_state["multi_guild_cache"] = None
+        return
+    guilds = [g for g in all_ranked if rank_start <= g["rank"] <= rank_end]
+    if not guilds:
+        st.warning(
+            f"The stored ranking has {len(all_ranked)} guilds "
+            f"(ranks {all_ranked[0]['rank']}–{all_ranked[-1]['rank']}), but none "
+            f"in your selected range {rank_start}–{rank_end}. Adjust the range."
+        )
+        st.session_state["multi_guild_cache"] = None
+        return
+
+    metrics: list[bool] = []
+    if show_deaths:
+        metrics.append(True)
+    if show_damage:
+        metrics.append(False)
+
+    ability_names = boss_config.get_ability_names(current_raid_file)
+    entries: list[dict] = []
+
+    # --- Pre-flight: check the API points budget before a big run ----------
+    # Rough per-(guild × metric × boss) cost: reports + a few reports' worth of
+    # fights/actors/events queries. Refuse up front if the budget can't cover it.
+    POINTS_PER_GUILD = 30
+    estimated_points = (
+        len(guilds) * max(1, len(metrics)) * max(1, len(targets)) * POINTS_PER_GUILD
+    )
+    try:
+        rl = get_rate_limit()
+        st.session_state["rate_limit"] = rl  # keep the indicator fresh
+        remaining = rl["limit_per_hour"] - rl["points_spent"]
+        if remaining < estimated_points:
+            mins = max(1, rl["points_reset_in"] // 60)
+            st.error(
+                f"Not enough Warcraft Logs API budget for this run. "
+                f"Estimated need ≈{estimated_points:,} points, but only "
+                f"{int(remaining):,} of {rl['limit_per_hour']:,}/hr remain "
+                f"(resets in ~{mins} min). Reduce the rank range or wait, then "
+                "try again."
+            )
+            st.session_state["multi_guild_cache"] = None
+            return
+        st.caption(
+            f"API budget OK — ~{int(remaining):,} points remain; this run "
+            f"needs ≈{estimated_points:,}."
+        )
+    except Exception:
+        # Couldn't read the budget (e.g. already throttled). Warn and proceed;
+        # per-call backoff + the skipped-guilds list handle throttling.
+        st.warning(
+            "Couldn't read the API rate-limit budget (you may already be "
+            "throttled). Proceeding — any guilds that fail will be listed below."
+        )
+
+    for target_index, tgt in enumerate(targets):
+        boss_id = tgt["boss_id"]
+        ability_id = tgt["ability_id"]
+        boss_name = tgt["boss_name"]
+
+        # Zone of this boss, so per-guild report scans only pull this raid's
+        # reports (skips Mythic+, alt runs, other raids) — a big speedup.
+        zone_id = get_encounter_zone_id(boss_id)
+
+        for metric_is_deaths in metrics:
+            progress_bar = st.progress(0.0)
+            status_area = st.empty()
+            metric_label = "deaths" if metric_is_deaths else "damage taken"
+
+            def _cb(done, total, _label=metric_label, _boss=boss_name):
+                progress_bar.progress(done / total if total else 1.0)
+                status_area.caption(
+                    f"{_boss} — {_label}: analyzed {done}/{total} guilds…"
+                )
+
+            rows, skipped, stats = aggregate_guilds(
+                guilds,
+                boss_id=boss_id,
+                ability_id=ability_id,
+                start_dt=start_dt,
+                end_dt=end_dt,
+                zone_id=zone_id,
+                difficulty=DIFFICULTY,
+                metric_is_deaths=metric_is_deaths,
+                ignore_after_player_deaths=ignore_after_player_deaths,
+                min_attendance_frac=source_settings.get("min_attendance_frac"),
+                progress_callback=_cb,
+            )
+            progress_bar.empty()
+            status_area.empty()
+
+            df = _build_multi_guild_table(rows, metric_is_deaths)
+
+            csv_buffer = io.StringIO()
+            writer = csv.writer(csv_buffer)
+            writer.writerow(
+                [boss_name, _ability_label(ability_id, ability_names)]
+            )
+            writer.writerow(df.columns.tolist())
+            for r in df.itertuples(index=False, name=None):
+                writer.writerow(r)
+            csv_bytes = csv_buffer.getvalue().encode("utf-8")
+
+            entries.append(
+                {
+                    "boss_name": boss_name,
+                    "ability_label": _ability_label(ability_id, ability_names),
+                    "metric_is_deaths": metric_is_deaths,
+                    "num_guilds": len(guilds),
+                    "num_players": len(rows),
+                    "df": df,
+                    "csv_bytes": csv_bytes,
+                    "skipped": skipped,
+                    "stats": stats,
+                    "min_attendance_frac": source_settings.get(
+                        "min_attendance_frac"
+                    ),
+                    "rank_start": rank_start,
+                    "rank_end": rank_end,
+                }
+            )
+
+    st.session_state["multi_guild_cache"] = {"entries": entries}
+
+
+def render_multi_guild_cache() -> None:
+    cache = st.session_state.get("multi_guild_cache")
+    if not cache or not cache.get("entries"):
+        st.info(
+            "Pick a rank range above, choose a boss/ability, "
+            "then click **Generate CSV**."
+        )
+        return
+
+    for i, entry in enumerate(cache["entries"]):
+        metric_text = "Deaths" if entry["metric_is_deaths"] else "Damage taken"
+        st.markdown(
+            f"#### {entry['boss_name']} — {entry['ability_label']} · {metric_text}"
+        )
+        st.success(
+            f"{entry['num_players']} players across {entry['num_guilds']} "
+            f"guilds (ranks {entry['rank_start']}–{entry['rank_end']})."
+        )
+
+        stats = entry.get("stats", {})
+        frac = entry.get("min_attendance_frac")
+        if frac and stats.get("filtered_low_attendance"):
+            st.caption(
+                f"Filtered out {stats['filtered_low_attendance']} low-attendance "
+                f"player(s) below {int(frac * 100)}% of their guild's "
+                "pulls-for-kill."
+            )
+
+        df = entry["df"]
+        search = st.text_input(
+            "Search player or guild",
+            value="",
+            key=f"mg_search_{i}",
+            placeholder="Type to filter…",
+        )
+        if search:
+            mask = df["Player"].str.contains(search, case=False, na=False) | df[
+                "Guild"
+            ].str.contains(search, case=False, na=False)
+            df = df[mask]
+
+        df = df.reset_index(drop=True)
+        df.index = range(1, len(df) + 1)
+        st.dataframe(df, use_container_width=True)
+
+        st.download_button(
+            "Download CSV",
+            data=entry["csv_bytes"],
+            file_name="warcraftlogs_top_guilds.csv",
+            mime="text/csv",
+            key=f"mg_download_{i}",
+        )
+
+        skipped = entry.get("skipped", [])
+        if skipped:
+            with st.expander(
+                f"⚠️ {len(skipped)} guild(s) contributed no data "
+                "(private logs, boss not pulled, or no matching deaths/hits)"
+            ):
+                for s in skipped:
+                    g = s["guild"]
+                    st.markdown(
+                        f"- **#{g.get('rank')} {g.get('guild_name')}** "
+                        f"({g.get('region')}) — {s['reason']}"
+                    )
+
+
+if source_mode == "ranking":
+    st.markdown("### 3. Results — Top guilds (world ranking)")
+    st.caption(
+        "Guilds are ranked via Warcraft Logs' public fight rankings for the "
+        "selected boss. Privately-logged guilds have no public ranking and are "
+        "not included."
+    )
+    if submitted:
+        compute_multi_guild_cache()
+    render_multi_guild_cache()
+    st.stop()
+
 
 # ====================================================================
 # 3. Results section
