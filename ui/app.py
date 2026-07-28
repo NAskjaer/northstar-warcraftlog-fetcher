@@ -11,7 +11,7 @@ import streamlit as st
 import pandas as pd
 from dotenv import load_dotenv
 
-from src.calendar_fetcher import fetch_logs_for_guild
+from src.calendar_fetcher import fetch_logs_for_guild, reports_up_to_first_kill
 from src.deaths_fetcher import (
     get_deaths_by_player_for_ability,
     get_boss_fights_for_report,
@@ -22,7 +22,11 @@ from src.survivability_fetcher import compute_survivability_for_report
 from src.api_client import get_rate_limit
 from src.guild_rankings_fetcher import get_encounter_zone_id
 from src.guild_rankings_store import load_ranking
-from src.multi_guild import aggregate_guilds, reset_report_caches
+from src.multi_guild import (
+    aggregate_guilds,
+    cached_boss_fights,
+    reset_report_caches,
+)
 from src import boss_config
 
 from sections.env_section import render_env_section
@@ -129,6 +133,7 @@ _render_rate_limit()
     ignore_after_player_deaths,
     submitted,
     source_settings,
+    stop_at_first_kill,
 ) = render_input_settings()
 
 # Get current raid file for ability name lookups
@@ -331,6 +336,7 @@ def compute_multi_guild_cache() -> None:
                 metric_is_deaths=metric_is_deaths,
                 ignore_after_player_deaths=ignore_after_player_deaths,
                 min_attendance_frac=source_settings.get("min_attendance_frac"),
+                stop_at_first_kill=stop_at_first_kill,
                 progress_callback=_cb,
             )
             progress_bar.empty()
@@ -510,18 +516,35 @@ def compute_and_cache_results(
         best_report = max(reps, key=_duration)
         best_reports_per_date.append((date_str, best_report))
 
+    # 2.5) "End at first kill": per boss, keep only the reports up to and
+    # including the one holding its first kill. Each boss gets its own cutoff.
+    progress_codes: dict[int, set[str]] = {}
+    if stop_at_first_kill:
+        reps = [r for _date, r in best_reports_per_date]
+        with st.spinner("Locating the first kill of each boss…"):
+            for boss_id in {t["boss_id"] for t in targets}:
+                progress_codes[boss_id] = {
+                    r["code"]
+                    for r in reports_up_to_first_kill(
+                        reps, boss_id, DIFFICULTY, fights_fn=cached_boss_fights
+                    )
+                }
+
     # 3) Build jobs only for the chosen report for that date.
     # (date_str, code, target_idx, boss_id, ability_id)
     jobs: list[tuple[str, str, int, int, int | None]] = []
     for date_str, report in best_reports_per_date:
         code = report["code"]
         for target_index, target in enumerate(targets):
+            boss_id = target["boss_id"]
+            if stop_at_first_kill and code not in progress_codes[boss_id]:
+                continue
             jobs.append(
                 (
                     date_str,
                     code,
                     target_index,
-                    target["boss_id"],
+                    boss_id,
                     target["ability_id"],
                 )
             )
@@ -993,6 +1016,9 @@ def render_from_cache(
 # Trigger computation (on button click) and always render from cache
 # --------------------------------------------------------------------
 if submitted and guild_id is not None:
+    # Fresh fights cache per run, so the deaths and damage passes share the
+    # first-kill scan instead of repeating it.
+    reset_report_caches()
     if show_deaths:
         compute_and_cache_results(
             metric_is_deaths=True,

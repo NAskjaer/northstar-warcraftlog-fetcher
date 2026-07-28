@@ -113,6 +113,7 @@ def render_input_settings() -> Tuple[
     int | None,
     bool,
     Dict[str, Any],
+    bool,
 ]:
     """Render the '2. Input settings' section and return user choices.
 
@@ -278,7 +279,11 @@ def render_input_settings() -> Tuple[
         default_start = date_cls(2026, 3, 31)
         default_end = today
 
-        col1, col2 = st.columns(2)
+        # The end of the range is either a date you pick, or each boss's first
+        # kill. Read the toggle before rendering the date so it can grey out.
+        stop_at_first_kill = st.session_state.get("end_mode") == "First kill"
+
+        col1, col2, col3 = st.columns([2, 2, 2])
         with col1:
             start_date = st.date_input(
                 "Start date",
@@ -289,7 +294,27 @@ def render_input_settings() -> Tuple[
             end_date = st.date_input(
                 "End date",
                 default_end,
+                disabled=stop_at_first_kill,
                 help="Only include logs on or before this date.",
+            )
+        with col3:
+            st.segmented_control(
+                "End of range",
+                options=["End date", "First kill"],
+                default="End date",
+                key="end_mode",
+                help=(
+                    "**End date** — stop on the date you picked.\n\n"
+                    "**First kill** — ignore the end date and stop at the log "
+                    "holding each boss's first kill, so only progression pulls "
+                    "are counted. In top-guilds mode the cutoff is per guild."
+                ),
+            )
+
+        if stop_at_first_kill:
+            end_date = default_end
+            st.caption(
+                "🏆 End date ignored — each boss stops at its own first kill."
             )
 
         # ------------------------------------------------------------------
@@ -577,4 +602,5 @@ def render_input_settings() -> Tuple[
         ignore_after_player_deaths,
         submitted,
         source_settings,
+        stop_at_first_kill,
     )
