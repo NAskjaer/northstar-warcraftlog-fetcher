@@ -142,8 +142,10 @@ def run_wcl_query(
             if attempt >= max_retries:
                 raise RuntimeError(
                     "Warcraft Logs rate limit hit (HTTP 429) and did not clear "
-                    "after retries. You've likely exhausted the hourly points "
-                    "budget — reduce the rank range or wait before retrying."
+                    "after retries. The hourly points budget is exhausted. The "
+                    "budget is per API client, so an overnight run or a second "
+                    "browser tab spends from the same pool. Wait for the hourly "
+                    "reset, or reduce the scope, before retrying."
                 )
             # Fail fast: short, capped waits so the UI doesn't block for minutes.
             # If the hourly points budget is exhausted, no amount of waiting in

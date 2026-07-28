@@ -2,7 +2,10 @@ from __future__ import annotations
 import os
 import io
 import csv
+import sys
+import json
 import time
+import subprocess
 from pathlib import Path
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -24,6 +27,8 @@ from src.guild_rankings_fetcher import get_encounter_zone_id
 from src.guild_rankings_store import load_ranking
 from src.multi_guild import aggregate_guilds, reset_report_caches
 from src import boss_config
+from src import estimate as est
+from src import overnight
 
 from sections.env_section import render_env_section
 from sections.input_settings import (
@@ -269,10 +274,8 @@ def compute_multi_guild_cache() -> None:
     # --- Pre-flight: check the API points budget before a big run ----------
     # Rough per-(guild × metric × boss) cost: reports + a few reports' worth of
     # fights/actors/events queries. Refuse up front if the budget can't cover it.
-    POINTS_PER_GUILD = 30
-    estimated_points = (
-        len(guilds) * max(1, len(metrics)) * max(1, len(targets)) * POINTS_PER_GUILD
-    )
+    num_passes = max(1, len(metrics)) * max(1, len(targets))
+    estimated_points = est.estimate_points(len(guilds), num_passes)
     try:
         rl = get_rate_limit()
         st.session_state["rate_limit"] = rl  # keep the indicator fresh
@@ -437,6 +440,151 @@ def render_multi_guild_cache() -> None:
                     )
 
 
+def render_ranking_estimate(num_guilds: int, num_passes: int) -> None:
+    """Show a live, API-free estimate of points + time for the current range."""
+    if num_guilds <= 0:
+        st.info("No guilds in the selected rank range.")
+        return
+
+    rl = st.session_state.get("rate_limit")
+    rl = rl if isinstance(rl, dict) and "error" not in rl else None
+    plan = est.plan(num_guilds, num_passes, rate_limit=rl)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Guilds in range", f"{num_guilds:,}")
+    c2.metric("Est. points needed", f"{plan['points']:,}")
+    c3.metric("Est. time", est.format_duration(plan["total_seconds"]))
+
+    if rl is None:
+        st.caption(
+            "Open **Warcraft Logs API rate limit** above and click "
+            "**Check rate limit** to see whether your budget covers this run."
+        )
+        return
+
+    remaining = int(plan["remaining"])
+    limit = plan["limit_per_hour"]
+    if plan.get("enough_now"):
+        st.success(
+            f"Budget OK — ~{remaining:,} of {limit:,}/hr remain; this run needs "
+            f"≈{plan['points']:,} points "
+            f"(compute {est.format_duration(plan['compute_seconds'])})."
+        )
+    elif plan.get("exceeds_hourly_budget"):
+        st.warning(
+            f"This needs ≈{plan['points']:,} points, more than the {limit:,}/hr "
+            f"cap — it can't finish in one window. An overnight run would span "
+            f"~{plan.get('windows_needed', 0)} hourly reset(s); "
+            f"total incl. waiting: {est.format_duration(plan['total_seconds'])}."
+        )
+    else:
+        st.warning(
+            f"Not enough budget right now: ~{remaining:,} left, need "
+            f"≈{plan['points']:,}. Wait "
+            f"{est.format_duration(plan['wait_seconds'])} for reset, reduce the "
+            f"range, or run overnight (total incl. waiting: "
+            f"{est.format_duration(plan['total_seconds'])})."
+        )
+
+
+def _launch_overnight(job: dict) -> Path:
+    """Write the job file and spawn overnight_run.py as a detached process."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    job_dir = (
+        PROJECT_ROOT / "output" / "overnight"
+        / f"{stamp}_r{job['rank_start']}-{job['rank_end']}"
+    )
+    job_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "job.json").write_text(
+        json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    creationflags = 0
+    if os.name == "nt":
+        # Detach so the run survives closing this Streamlit process/tab.
+        creationflags = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | 0x00000008
+        )  # 0x08 = DETACHED_PROCESS
+    log_f = open(job_dir / "run.log", "ab")
+    subprocess.Popen(
+        # -u: unbuffered stdout/stderr. Without it, print() to a file is
+        # block-buffered and a run that dies mid-flight leaves run.log empty.
+        [sys.executable, "-u", str(PROJECT_ROOT / "overnight_run.py"),
+         "--job", str(job_dir / "job.json")],
+        cwd=str(PROJECT_ROOT),
+        stdout=log_f,
+        stderr=log_f,
+        creationflags=creationflags,
+        close_fds=True,
+    )
+    return job_dir
+
+
+def _render_overnight_status(job_dir: str, status: dict) -> None:
+    state = status.get("state", "?")
+    prog = status.get("progress", {}) or {}
+    done, total = prog.get("done", 0), (prog.get("total", 0) or 1)
+    badge = {
+        "starting": "⏳", "running": "🟢", "waiting": "🟡",
+        "done": "✅", "error": "🔴", "stopped": "⏹️",
+    }.get(state, "•")
+
+    st.markdown(f"**State:** {badge} {state} · {status.get('current', '')}")
+    st.progress(min(1.0, done / total))
+    st.caption(f"{done}/{total} guild-passes · {status.get('message', '')}")
+
+    b = status.get("budget")
+    if isinstance(b, dict):
+        rem = int(b["limit_per_hour"] - b["points_spent"])
+        st.caption(
+            f"Budget: ~{rem:,}/{b['limit_per_hour']:,} pts left · "
+            f"resets ~{max(1, b['points_reset_in'] // 60)}m"
+        )
+    if status.get("error"):
+        st.error(status["error"])
+
+    for out in status.get("outputs", []):
+        p = Path(out)
+        if p.exists():
+            st.download_button(
+                f"Download {p.name}", data=p.read_bytes(),
+                file_name=p.name, mime="text/csv", key=f"ovn_dl_{p.name}",
+            )
+
+    if state in ("starting", "running", "waiting"):
+        if st.button("Stop run", key="stop_overnight"):
+            overnight.request_stop(job_dir)
+            st.info("Stop requested — it will exit at the next checkpoint.")
+
+
+def render_overnight_launcher(job: dict) -> None:
+    with st.expander("🌙 Overnight run (auto-resume through rate limits)"):
+        st.caption(
+            "Runs headless in the background, pausing and re-checking the budget "
+            "every 5 min while it's exhausted, then resuming — so a range too big "
+            "for one hour just finishes overnight. It's a separate process, so it "
+            "keeps going even if you close this browser tab (leave the machine on)."
+        )
+        cols = st.columns([1, 1, 2])
+        if cols[0].button("Launch overnight run", key="launch_overnight"):
+            try:
+                job_dir = _launch_overnight(job)
+                st.session_state["overnight_job_dir"] = str(job_dir)
+                st.success(f"Launched. Job dir: `{job_dir}`")
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Couldn't launch overnight run: {exc}")
+        cols[1].button("Refresh status", key="refresh_overnight")
+
+        job_dir = st.session_state.get("overnight_job_dir")
+        if not job_dir:
+            return
+        status = overnight.read_status(job_dir)
+        if status is None:
+            st.info("Waiting for the run to write its first status…")
+            return
+        _render_overnight_status(job_dir, status)
+
+
 if source_mode == "ranking":
     st.markdown("### 3. Results — Top guilds (world ranking)")
     st.caption(
@@ -444,6 +592,36 @@ if source_mode == "ranking":
         "selected boss. Privately-logged guilds have no public ranking and are "
         "not included."
     )
+
+    # --- Live estimate + overnight launcher (both API-free to build) ----------
+    _rank_start = source_settings.get("rank_start", 1)
+    _rank_end = source_settings.get("rank_end", 1)
+    _all_ranked = load_ranking(current_raid_file)
+    _num_guilds = sum(
+        1 for g in _all_ranked if _rank_start <= g["rank"] <= _rank_end
+    )
+    _num_metrics = (1 if show_deaths else 0) + (1 if show_damage else 0)
+    _num_passes = max(1, _num_metrics) * max(1, len(targets))
+    render_ranking_estimate(_num_guilds, _num_passes)
+
+    _metric_str = (
+        "both" if (show_deaths and show_damage)
+        else ("deaths" if show_deaths else "damage")
+    )
+    _overnight_job = {
+        "raid_file": current_raid_file,
+        "rank_start": _rank_start,
+        "rank_end": _rank_end,
+        "metric": _metric_str,
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "min_attendance_frac": source_settings.get("min_attendance_frac"),
+        "ignore_after_player_deaths": ignore_after_player_deaths,
+        "targets": targets,
+        "poll_seconds": 300,
+    }
+    render_overnight_launcher(_overnight_job)
+
     if submitted:
         compute_multi_guild_cache()
     render_multi_guild_cache()
@@ -481,7 +659,14 @@ def compute_and_cache_results(
 
     # --- Fetch reports for guild/date range -----------------------------
     with st.spinner(f"Fetching reports from Warcraft Logs for {metric_label}…"):
-        reports = fetch_logs_for_guild(guild_id, start_dt, end_dt)
+        try:
+            reports = fetch_logs_for_guild(guild_id, start_dt, end_dt)
+        except RuntimeError as exc:
+            # Usually the hourly points budget (429). Surface it as a message
+            # and keep any previously cached results on screen, rather than
+            # crashing the page with a raw traceback.
+            st.error(f"Could not fetch reports for {metric_label}: {exc}")
+            return
 
     if not reports:
         st.warning("No reports found in that date range.")
