@@ -60,4 +60,10 @@ The app will now call warcraftlogs to check if the Secret and Client ID is valid
 ## Using the analyzer
 #### Input settings
 
-TODO
+By default the analyzer targets Midnight Falls with the ability "Heaven's Glaives" pre-selected, "Ignore events after player deaths" set to 3, and "End of range" set to "First kill" (each boss stops at its own first kill instead of a fixed end date) — tuned for the fewest clicks on the current tier. All of these can be changed per run.
+
+#### Results table
+
+Each results table shows a **Class** column (e.g. "Warrior (Fury)") next to **Player**, colored by the character's WoW class, alongside **Total Deaths** / **Total Damage Taken** and a per-report-day breakdown. Click a column header to sort; rows alternate with a faint stripe for readability.
+
+If you select both **Deaths** and **Damage taken**, the two tables show side by side once you switch the page to **Wide mode** (Streamlit's settings menu, top right) — in the default (centered) layout, or with only one metric selected, each table shows full per-date detail; side by side, they're trimmed to just Class / Player / Totals to fit the space (the CSV download always includes the full per-date breakdown regardless).

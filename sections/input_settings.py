@@ -42,11 +42,15 @@ def _init_boss_blocks() -> None:
         # common case); fall back to the first boss for other raids.
         default_boss = "Midnight Falls" if "Midnight Falls" in boss_names else boss_names[0]
 
+        # Default to "Heaven's Glaives" (1254076) under Midnight Falls, too
+        # (fewer clicks for the common case).
+        default_abilities = [1254076] if default_boss == "Midnight Falls" else []
+
         st.session_state["boss_blocks"] = [
             {
                 "id": 0,
                 "boss_name": default_boss,
-                "selected_abilities": [],
+                "selected_abilities": default_abilities,
             }
         ]
         st.session_state["next_boss_block_id"] = 1
@@ -95,7 +99,7 @@ def _render_ignore_input() -> int:
         "Ignore events after player deaths",
         min_value=0,
         step=1,
-        value=0,
+        value=3,
         help=(
             "Matches Warcraft Logs' 'Ignore Events After Player Deaths' option. "
             "If set to N > 0, events after the Nth player death in a pull "
@@ -281,7 +285,10 @@ def render_input_settings() -> Tuple[
 
         # The end of the range is either a date you pick, or each boss's first
         # kill. Read the toggle before rendering the date so it can grey out.
-        stop_at_first_kill = st.session_state.get("end_mode") == "First kill"
+        # ("First kill" is the default, matching the segmented_control below;
+        # use it as the .get() fallback so the very first render — before
+        # "end_mode" exists in session_state — matches too.)
+        stop_at_first_kill = st.session_state.get("end_mode", "First kill") == "First kill"
 
         col1, col2, col3 = st.columns([2, 2, 2])
         with col1:
@@ -301,7 +308,7 @@ def render_input_settings() -> Tuple[
             st.segmented_control(
                 "End of range",
                 options=["End date", "First kill"],
-                default="End date",
+                default="First kill",
                 key="end_mode",
                 help=(
                     "**End date** — stop on the date you picked.\n\n"

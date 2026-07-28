@@ -22,6 +22,7 @@ from src.deaths_fetcher import (
 )
 from src.damage_taken_fetcher import get_damage_taken_by_player_for_ability
 from src.survivability_fetcher import compute_survivability_for_report
+from src.player_details_fetcher import get_player_class_specs
 from src.api_client import get_rate_limit
 from src.guild_rankings_fetcher import get_encounter_zone_id
 from src.guild_rankings_store import load_ranking
@@ -745,6 +746,7 @@ def compute_and_cache_results(
 
     meta_by_target_date: dict[tuple[int, str], dict] = {}
     all_players: set[str] = set()
+    player_class_spec_global: dict[str, tuple[str, str]] = {}
 
     def process_job(job: tuple[str, str, int, int, int | None]) -> dict:
         """Run the chosen metric fetcher for a single (report, target)."""
@@ -825,6 +827,18 @@ def compute_and_cache_results(
             except Exception:
                 player_pulls = {}
 
+        # 6) Class/spec per player for this report, so results tables can
+        #    show "<Class> (<Spec>)" and color rows by class. Use every fight
+        #    for this boss (not just wipes) so a clean-kill report still
+        #    yields class/spec data.
+        player_class_spec: dict[str, tuple[str, str]] = {}
+        if fights:
+            try:
+                fight_ids_for_specs = [f["id"] for f in fights]
+                player_class_spec = get_player_class_specs(code, fight_ids_for_specs)
+            except Exception:
+                player_class_spec = {}
+
         return {
             "target_index": target_index,
             "date_str": date_str,
@@ -833,6 +847,7 @@ def compute_and_cache_results(
             "player_hits": player_hits,
             "num_pulls": len(wipes),
             "player_pulls": player_pulls,
+            "player_class_spec": player_class_spec,
         }
 
     # --- Run jobs in parallel -------------------------------------------
@@ -866,6 +881,7 @@ def compute_and_cache_results(
             player_hits = result["player_hits"]
             num_pulls = result["num_pulls"]
             player_pulls = result.get("player_pulls", {})
+            player_class_spec = result.get("player_class_spec", {})
 
             key = (target_index, date_str)
             meta_by_target_date[key] = {
@@ -876,6 +892,8 @@ def compute_and_cache_results(
                 "player_pulls": player_pulls,
             }
             all_players.update(player_counts.keys())
+            for name, class_spec in player_class_spec.items():
+                player_class_spec_global.setdefault(name, class_spec)
 
     progress_bar.empty()
     status_area.empty()
@@ -1026,12 +1044,20 @@ def compute_and_cache_results(
             key=lambda p: (-player_totals[p], p.lower()),
         )
 
+        def _class_spec_label(player: str) -> str:
+            cls, spec = player_class_spec_global.get(player, ("", ""))
+            if cls and spec:
+                return f"{cls} ({spec})"
+            if cls:
+                return cls
+            return "Unknown"
+
         if metric_is_deaths:
             # Deaths: just one metric column
-            df_columns_internal = ["Player", "Total Deaths"] + date_columns
+            df_columns_internal = ["Class", "Player", "Total Deaths"] + date_columns
             rows_for_display: list[list[object]] = []
             for player in sorted_players:
-                row = [player, player_totals[player]]
+                row = [_class_spec_label(player), player, player_totals[player]]
                 for _date, code, _counts, _pulls, _hits, _ppulls in entries:
                     val = per_report_counts.get(code, {}).get(player, 0)
                     row.append(val)
@@ -1052,7 +1078,7 @@ def compute_and_cache_results(
                 date_damage_cols.append(f"{date}__hits")
 
             df_columns_internal = (
-                ["Player", "Total Deaths", "Total Hits"] + date_damage_cols
+                ["Class", "Player", "Total Deaths", "Total Hits"] + date_damage_cols
             )
 
             player_totals_hits: dict[str, int] = {}
@@ -1067,6 +1093,7 @@ def compute_and_cache_results(
             rows_for_display = []
             for player in sorted_players:
                 row = [
+                    _class_spec_label(player),
                     player,
                     player_totals[player],
                     player_totals_hits.get(player, 0),
@@ -1125,12 +1152,18 @@ def compute_and_cache_results(
             for label, code in zip(friendly_date_labels, report_codes)
         ]
 
+        # Class/Player/Total(s) are always the leading columns, followed by
+        # the per-date/log columns — used to trim to just the summary
+        # columns in compact (side-by-side) mode.
+        summary_col_count = 3 if metric_is_deaths else 4
+
         tables[target_index] = {
             "df": df,
             "df_display": df_display,
             "csv_bytes": csv_bytes,
             "log_links": log_links,
             "player_pulls": player_pull_totals,
+            "summary_col_count": summary_col_count,
         }
 
         # Update global list of logs for this run
@@ -1176,6 +1209,7 @@ def render_from_cache(
     cache_key: str,
     key_prefix: str,
     section_title: str,
+    compact: bool = False,
 ) -> None:
     """Render results for a metric using cached data (if available)."""
     cache_root = st.session_state.get("results_cache", {})
@@ -1194,6 +1228,7 @@ def render_from_cache(
         cache.get("raid_file", "Midnight_season_1.json"),  # Get raid file from cache
         key_prefix=key_prefix,
         section_title=section_title,
+        compact=compact,
     )
 
 
@@ -1215,20 +1250,59 @@ if submitted and guild_id is not None:
             cache_key="damage",
         )
 
-# Always render whatever we have cached, based on current metric_mode
-if show_deaths:
+# Always render whatever we have cached, based on current metric_mode.
+# When both metrics are shown, put them side by side — but only once the
+# container is actually wide enough (i.e. Streamlit's "Wide mode" is on).
+# st.columns() itself has no such awareness (it always sits side by side,
+# just getting cramped in the default centered layout), so instead the two
+# columns are given a flex-basis via CSS scoped to this one keyed container:
+# under the ~730px-wide centered layout they don't fit side by side and
+# wrap onto separate lines; once Wide mode removes that cap, they fit and
+# sit side by side.
+if show_deaths and show_damage:
+    st.markdown(
+        """
+        <style>
+          div.st-key-results_side_by_side [data-testid="stHorizontalBlock"] {
+            flex-wrap: wrap;
+          }
+          div.st-key-results_side_by_side [data-testid="stColumn"] {
+            flex: 1 1 480px;
+            min-width: 420px;
+          }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    with st.container(key="results_side_by_side"):
+        col_deaths, col_damage = st.columns(2)
+        with col_deaths:
+            render_from_cache(
+                metric_is_deaths=True,
+                cache_key="deaths",
+                key_prefix="deaths_",
+                section_title="### 3. Results — Deaths",
+                compact=True,
+            )
+        with col_damage:
+            render_from_cache(
+                metric_is_deaths=False,
+                cache_key="damage",
+                key_prefix="damage_",
+                section_title="### 4. Results — Damage taken",
+                compact=True,
+            )
+elif show_deaths:
     render_from_cache(
         metric_is_deaths=True,
         cache_key="deaths",
         key_prefix="deaths_",
         section_title="### 3. Results — Deaths",
     )
-
-if show_damage:
-    sec_number = "4" if show_deaths else "3"
+elif show_damage:
     render_from_cache(
         metric_is_deaths=False,
         cache_key="damage",
         key_prefix="damage_",
-        section_title=f"### {sec_number}. Results — Damage taken",
+        section_title="### 3. Results — Damage taken",
     )

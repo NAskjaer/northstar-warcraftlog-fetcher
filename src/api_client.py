@@ -112,10 +112,12 @@ def run_wcl_query(
 
     Retries on HTTP 429 (Too Many Requests) with backoff, honoring the
     Retry-After header when present, so bursts of concurrent requests don't
-    fail outright.
+    fail outright. Also retries on read timeouts / connection errors, since
+    warcraftlogs.com occasionally stalls on a single request without
+    actually being rate-limited.
 
     Raises RuntimeError if the API returns GraphQL errors, or if it keeps
-    returning 429 after max_retries.
+    returning 429 or timing out after max_retries.
     """
     import time as _time
 
@@ -131,12 +133,22 @@ def run_wcl_query(
         # Fetch (cached) token each attempt; it refreshes if expired.
         headers["Authorization"] = f"Bearer {get_wcl_token()}"
 
-        resp = requests.post(
-            WCL_GRAPHQL_URL,
-            json=payload,
-            headers=headers,
-            timeout=30,
-        )
+        try:
+            resp = requests.post(
+                WCL_GRAPHQL_URL,
+                json=payload,
+                headers=headers,
+                timeout=30,
+            )
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            if attempt >= max_retries:
+                raise RuntimeError(
+                    "Warcraft Logs API kept timing out / failing to connect "
+                    f"after {max_retries + 1} attempts: {exc}"
+                ) from exc
+            wait = min(2 ** attempt, 8)  # 1, 2, 4, capped 8
+            _time.sleep(wait)
+            continue
 
         if resp.status_code == 429:
             if attempt >= max_retries:
