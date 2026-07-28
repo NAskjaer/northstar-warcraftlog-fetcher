@@ -21,7 +21,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from .calendar_fetcher import fetch_logs_for_guild
+from .calendar_fetcher import fetch_logs_for_guild, reports_up_to_first_kill
 from .deaths_fetcher import (
     get_boss_fights_for_report,
     _fetch_death_events,
@@ -53,7 +53,10 @@ def reset_report_caches() -> None:
         _deaths_cache.clear()
 
 
-def _cached_fights(code: str, boss_id: int, difficulty: int) -> List[Dict[str, Any]]:
+def cached_boss_fights(
+    code: str, boss_id: int, difficulty: int | None = 5
+) -> List[Dict[str, Any]]:
+    """Boss fights for a report, memoised for the current run (see reset above)."""
     key = (code, boss_id, difficulty)
     with _cache_lock:
         if key in _fights_cache:
@@ -134,7 +137,7 @@ def _analyse_report(
     per-player values, per-player pulls, and the wipe-pull count, or None if the
     boss isn't present in this report.
     """
-    fights = _cached_fights(report_code, boss_id, difficulty)
+    fights = cached_boss_fights(report_code, boss_id, difficulty)
     if not fights:
         return None
     # Wipes only, to match the rest of the app.
@@ -220,6 +223,7 @@ def _analyse_one_guild(
     start_dt,
     end_dt,
     zone_id: Optional[int] = None,
+    stop_at_first_kill: bool = False,
 ) -> Dict[str, Any]:
     """Aggregate a single guild's logs over the date range for one boss+ability."""
     guild_id = guild.get("guild_id")
@@ -234,6 +238,20 @@ def _analyse_one_guild(
     if not reports:
         result["error"] = "no public logs in range"
         return result
+
+    if stop_at_first_kill:
+        # Uses the per-run fights cache, so this costs nothing the analysis
+        # below wouldn't have paid anyway.
+        try:
+            reports = reports_up_to_first_kill(
+                reports,
+                boss_id,
+                difficulty,
+                fights_fn=cached_boss_fights,
+            )
+        except Exception as exc:
+            result["error"] = f"could not locate first kill: {exc}"
+            return result
 
     per_value: Dict[str, int] = {}
     per_hits: Dict[str, int] = {}
@@ -301,6 +319,7 @@ def aggregate_guilds(
     metric_is_deaths: bool = True,
     ignore_after_player_deaths: Optional[int] = None,
     min_attendance_frac: Optional[float] = 0.8,
+    stop_at_first_kill: bool = False,
     max_workers: int = 4,
     progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, int]]:
@@ -309,6 +328,9 @@ def aggregate_guilds(
 
     If ``min_attendance_frac`` is set (e.g. 0.8), players who attended fewer
     than that fraction of their guild's total pulls in the range are dropped.
+
+    With ``stop_at_first_kill``, each guild's logs are cut off at its own first
+    kill of the boss, so only that guild's progression pulls are counted.
 
     Returns (rows, skipped, stats) where:
       rows    = merged per-player dicts across all guilds, sorted by value desc
@@ -333,6 +355,7 @@ def aggregate_guilds(
                 start_dt=start_dt,
                 end_dt=end_dt,
                 zone_id=zone_id,
+                stop_at_first_kill=stop_at_first_kill,
             ): g
             for g in guilds
         }
