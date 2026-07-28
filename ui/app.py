@@ -5,6 +5,7 @@ import csv
 import sys
 import json
 import time
+import threading
 import subprocess
 from pathlib import Path
 from datetime import datetime, timezone
@@ -14,21 +15,34 @@ import streamlit as st
 import pandas as pd
 from dotenv import load_dotenv
 
+try:
+    # Lets a background thread (a fetch's worker threads, ultimately) push
+    # live updates into a placeholder created on the main script thread —
+    # without this, anything set from inside a blocking fetch (e.g. a 429
+    # retry) is invisible until that whole blocking call returns, since the
+    # rate-limit section's own code only runs once per script execution.
+    # Defensive import: this is a semi-internal Streamlit API whose module
+    # path has moved before across versions — degrade to no live updates
+    # rather than crash the app if it's missing.
+    from streamlit.runtime.scriptrunner import add_script_run_ctx
+except Exception:  # pragma: no cover - depends on installed streamlit version
+    add_script_run_ctx = None
+
 from src.calendar_fetcher import fetch_logs_for_guild, reports_up_to_first_kill
-from src.deaths_fetcher import (
-    get_deaths_by_player_for_ability,
-    get_boss_fights_for_report,
-    _fetch_player_actors,
-)
+from src.deaths_fetcher import get_deaths_by_player_for_ability
 from src.damage_taken_fetcher import get_damage_taken_by_player_for_ability
 from src.survivability_fetcher import compute_survivability_for_report
-from src.player_details_fetcher import get_player_class_specs
-from src.api_client import get_rate_limit
+from src.api_client import get_rate_limit, is_retryable_error, get_retry_status
 from src.guild_rankings_fetcher import get_encounter_zone_id
 from src.guild_rankings_store import load_ranking
-from src.multi_guild import (
-    aggregate_guilds,
-    cached_boss_fights,
+from src.guild_url import parse_guild_id_from_url
+from src.live_runner import LiveMultiGuildRun
+from src.log_utils import log_line
+from src.report_cache import (
+    get_boss_fights,
+    get_report_actors,
+    get_report_class_specs,
+    get_stats as get_report_cache_stats,
     reset_report_caches,
 )
 from src import boss_config
@@ -40,7 +54,7 @@ from sections.input_settings import (
     render_input_settings,
     DIFFICULTY,
 )
-from sections.results_section import render_results
+from sections.results_section import render_results, render_class_colored_table
 
 
 # --------------------------------------------------------------------
@@ -90,18 +104,119 @@ if not env_ok:
 # API rate-limit indicator (same numbers as warcraftlogs.com/profile).
 # On-demand: reading it costs 1 point, so only refresh when clicked.
 # ====================================================================
+_RETRY_WATCHER_STOP_KEY = "_retry_watcher_stop_event"
+
+
+def _stop_prev_retry_watcher() -> None:
+    """Signal any watcher thread from an earlier script run to stop. Its
+    writes would be silently dropped anyway once superseded by this new
+    run, but there's no reason to leave it polling forever."""
+    prev_stop = st.session_state.get(_RETRY_WATCHER_STOP_KEY)
+    if prev_stop is not None:
+        prev_stop.set()
+
+
+def _start_retry_watcher(placeholder) -> None:
+    """
+    Background thread mirroring api_client's live retry/pause status into
+    `placeholder`, independent of whether the *main* script thread is stuck
+    inside a blocking fetch (single-guild mode runs its whole fetch as one
+    blocking call with no reruns in between — without this, a 429 retry
+    happening inside it would be invisible until the fetch finishes, since
+    the rate-limit section's own code only runs once per script execution).
+    """
+    if add_script_run_ctx is None:
+        return  # installed Streamlit version doesn't expose this API
+
+    stop_event = threading.Event()
+    st.session_state[_RETRY_WATCHER_STOP_KEY] = stop_event
+
+    def _watch() -> None:
+        last_shown = None
+        while not stop_event.is_set():
+            status = get_retry_status()
+            if status != last_shown:
+                try:
+                    if status:
+                        placeholder.warning(f"⏳ {status['message']}")
+                    else:
+                        placeholder.empty()
+                except Exception:
+                    return  # this script run has since ended
+                last_shown = status
+            stop_event.wait(0.5)
+
+    t = threading.Thread(target=_watch, daemon=True)
+    add_script_run_ctx(t)
+    t.start()
+
+
 def _render_rate_limit() -> None:
+    _stop_prev_retry_watcher()
+
+    # Kept OUTSIDE the expander (not gated behind it being open) so a retry
+    # happening mid-fetch is visible without the user needing to know to
+    # click into a collapsed section first.
+    retry_placeholder = st.empty()
+    _status = get_retry_status()
+    if _status:
+        retry_placeholder.warning(f"⏳ {_status['message']}")
+    _start_retry_watcher(retry_placeholder)
+
     with st.expander("Warcraft Logs API rate limit", expanded=False):
         if st.button("Check rate limit", key="check_rate_limit"):
             try:
-                st.session_state["rate_limit"] = get_rate_limit()
-            except Exception as exc:  # already throttled / network error
-                st.session_state["rate_limit"] = {"error": str(exc)}
+                rl = get_rate_limit()
+                st.session_state["rate_limit"] = rl
+                st.session_state["rate_limit_fetched_at"] = time.time()
+            except Exception as exc:  # the check itself costs a point and can 429 too
+                if is_retryable_error(str(exc)):
+                    # Estimate a reset time from the last successful check rather
+                    # than just dumping the raw 429 — "you're capped" plus a
+                    # rough ETA is a lot more useful than a stack-trace-shaped
+                    # error message.
+                    prev = st.session_state.get("rate_limit")
+                    prev_at = st.session_state.get("rate_limit_fetched_at")
+                    est_reset_in = None
+                    limit_guess = 3600
+                    if prev and "error" not in prev:
+                        limit_guess = prev.get("limit_per_hour", 3600)
+                        if prev_at:
+                            elapsed = max(0.0, time.time() - prev_at)
+                            est_reset_in = max(
+                                0, int(prev.get("points_reset_in", 0) - elapsed)
+                            )
+                    st.session_state["rate_limit"] = {
+                        "error": str(exc),
+                        "capped": True,
+                        "limit_per_hour": limit_guess,
+                        "points_reset_in_estimate": est_reset_in,
+                    }
+                else:
+                    st.session_state["rate_limit"] = {"error": str(exc)}
 
         rl = st.session_state.get("rate_limit")
         if rl is None:
             st.caption("Click **Check rate limit** to see your current usage.")
             return
+
+        if rl.get("capped"):
+            limit = rl.get("limit_per_hour", 3600)
+            st.error(f"Capped — {limit:,} of {limit:,} points used this hour (HTTP 429).")
+            reset_est = rl.get("points_reset_in_estimate")
+            if reset_est is not None:
+                mins = max(1, reset_est // 60)
+                st.caption(
+                    f"Estimated from your last successful check — should reset "
+                    f"in ~{mins} min."
+                )
+            else:
+                st.caption(
+                    "No earlier check on record to estimate a reset time from — "
+                    "try again in a few minutes."
+                )
+            return
+
         if "error" in rl:
             st.warning(
                 "Couldn't read the rate limit (you may already be throttled): "
@@ -149,15 +264,12 @@ current_raid_file = st.session_state["selected_raid_file"]
 
 source_mode = source_settings.get("mode", "single")
 
-# Parse guild id (single-guild mode only; ranking mode sources guilds from
-# the rankings API and does not use a guild URL).
+# Parse guild id (single-guild mode only; multi-guild mode sources guilds
+# from the stored ranking or a pasted list, not a single guild URL).
 guild_id: int | None = None
 if source_mode == "single":
-    try:
-        parts = guild_url.strip("/").split("/")
-        idx = parts.index("id") + 1
-        guild_id = int(parts[idx])
-    except Exception:
+    guild_id = parse_guild_id_from_url(guild_url)
+    if guild_id is None:
         if submitted:
             st.error(
                 "Could not parse guild ID from URL. "
@@ -166,7 +278,6 @@ if source_mode == "single":
         # If URL is bad and we have no previous result, nothing to show
         if not st.session_state["analysis_cache"]:
             st.stop()
-        guild_id = None  # will not be used when we load from cache
 
 # Convert date range to UTC datetimes
 start_dt = datetime(
@@ -207,20 +318,35 @@ def _ability_label(ability_id, ability_names) -> str:
     return f"{ability_id} ({ability_names.get(ability_id, 'Unknown')})"
 
 
+def _class_spec_label(class_spec) -> str:
+    cls, spec = class_spec or ("", "")
+    if cls and spec:
+        return f"{cls} ({spec})"
+    if cls:
+        return cls
+    return "Unknown"
+
+
 def _build_multi_guild_table(rows, metric_is_deaths):
-    """Turn merged per-player rows into (df_display, csv-ready df)."""
+    """Turn merged per-player rows into a display-ready DataFrame, Class first."""
     if metric_is_deaths:
-        columns = ["Player", "Guild", "Total Deaths", "Pulls", "Guild Pulls"]
+        columns = ["Class", "Player", "Guild", "Total Deaths", "Pulls", "Guild Pulls"]
         data = [
-            [r["player"], r["guild"], r["value"], r["pulls"], r.get("pulls_for_kill", 0)]
+            [
+                _class_spec_label(r.get("class_spec")),
+                r["player"], r["guild"], r["value"], r["pulls"],
+                r.get("pulls_for_kill", 0),
+            ]
             for r in rows
         ]
     else:
         columns = [
-            "Player", "Guild", "Total Damage Taken", "Hits", "Pulls", "Guild Pulls"
+            "Class", "Player", "Guild", "Total Damage Taken", "Hits", "Pulls",
+            "Guild Pulls",
         ]
         data = [
             [
+                _class_spec_label(r.get("class_spec")),
                 r["player"],
                 r["guild"],
                 r["value"],
@@ -233,40 +359,50 @@ def _build_multi_guild_table(rows, metric_is_deaths):
     return pd.DataFrame(data, columns=columns)
 
 
-def compute_multi_guild_cache() -> None:
-    """Fetch top guilds and aggregate players for each target + metric."""
+def start_live_multi_guild_run() -> None:
+    """
+    Validate inputs, do the upfront budget sanity check, then kick off a
+    background LiveMultiGuildRun and return immediately — poll_live_multi_
+    guild_run() drives it to completion across subsequent reruns so the UI
+    stays responsive (progress updates, a working Stop button) instead of
+    blocking the script inside one big aggregate_guilds() call per pass.
+    """
     if not targets:
         st.error("Please configure at least one boss to analyze.")
         st.session_state["multi_guild_cache"] = None
         return
 
-    # Fresh caches per run so fights/actors/death-events fetched for one
-    # metric or ability are reused by the others instead of re-queried.
-    reset_report_caches()
-
+    guild_input_mode = source_settings.get("guild_input_mode", "rank")
     rank_start = source_settings["rank_start"]
     rank_end = source_settings["rank_end"]
 
-    # Guilds come from the stored progress ranking (the true world-progress
-    # order), which costs ZERO API calls. Slice it to the requested rank range.
-    all_ranked = load_ranking(current_raid_file)
+    if guild_input_mode == "links":
+        guilds = source_settings.get("manual_guilds") or []
+        if not guilds:
+            st.error("Paste at least one guild URL above, then try again.")
+            st.session_state["multi_guild_cache"] = None
+            return
+    else:
+        # Guilds come from the stored progress ranking (the true world-progress
+        # order), which costs ZERO API calls. Slice it to the requested rank range.
+        all_ranked = load_ranking(current_raid_file)
 
-    if not all_ranked:
-        st.error(
-            f"No stored ranking for this raid yet. Add one at "
-            f"config/guild_rankings/{current_raid_file}."
-        )
-        st.session_state["multi_guild_cache"] = None
-        return
-    guilds = [g for g in all_ranked if rank_start <= g["rank"] <= rank_end]
-    if not guilds:
-        st.warning(
-            f"The stored ranking has {len(all_ranked)} guilds "
-            f"(ranks {all_ranked[0]['rank']}–{all_ranked[-1]['rank']}), but none "
-            f"in your selected range {rank_start}–{rank_end}. Adjust the range."
-        )
-        st.session_state["multi_guild_cache"] = None
-        return
+        if not all_ranked:
+            st.error(
+                f"No stored ranking for this raid yet. Add one at "
+                f"config/guild_rankings/{current_raid_file}."
+            )
+            st.session_state["multi_guild_cache"] = None
+            return
+        guilds = [g for g in all_ranked if rank_start <= g["rank"] <= rank_end]
+        if not guilds:
+            st.warning(
+                f"The stored ranking has {len(all_ranked)} guilds "
+                f"(ranks {all_ranked[0]['rank']}–{all_ranked[-1]['rank']}), but none "
+                f"in your selected range {rank_start}–{rank_end}. Adjust the range."
+            )
+            st.session_state["multi_guild_cache"] = None
+            return
 
     metrics: list[bool] = []
     if show_deaths:
@@ -275,11 +411,12 @@ def compute_multi_guild_cache() -> None:
         metrics.append(False)
 
     ability_names = boss_config.get_ability_names(current_raid_file)
-    entries: list[dict] = []
 
     # --- Pre-flight: check the API points budget before a big run ----------
-    # Rough per-(guild × metric × boss) cost: reports + a few reports' worth of
-    # fights/actors/events queries. Refuse up front if the budget can't cover it.
+    # Rough per-(guild × metric × boss) cost. Refuses up front if it's clearly
+    # not enough; a mid-run shortfall (estimate was too low, or budget spent
+    # elsewhere concurrently) is caught by the run itself instead, which
+    # stops immediately rather than grinding through doomed guilds.
     num_passes = max(1, len(metrics)) * max(1, len(targets))
     estimated_points = est.estimate_points(len(guilds), num_passes)
     try:
@@ -303,88 +440,151 @@ def compute_multi_guild_cache() -> None:
         )
     except Exception:
         # Couldn't read the budget (e.g. already throttled). Warn and proceed;
-        # per-call backoff + the skipped-guilds list handle throttling.
+        # the run's own per-chunk budget check will stop it if there's
+        # genuinely nothing left.
         st.warning(
             "Couldn't read the API rate-limit budget (you may already be "
-            "throttled). Proceeding — any guilds that fail will be listed below."
+            "throttled). Proceeding — the run will stop itself if the budget "
+            "turns out to be exhausted."
         )
 
+    passes: list[tuple[int, bool, dict, int | None]] = []
     for target_index, tgt in enumerate(targets):
-        boss_id = tgt["boss_id"]
-        ability_id = tgt["ability_id"]
-        boss_name = tgt["boss_name"]
-
         # Zone of this boss, so per-guild report scans only pull this raid's
         # reports (skips Mythic+, alt runs, other raids) — a big speedup.
-        zone_id = get_encounter_zone_id(boss_id)
-
+        zone_id = get_encounter_zone_id(tgt["boss_id"])
         for metric_is_deaths in metrics:
-            progress_bar = st.progress(0.0)
-            status_area = st.empty()
-            metric_label = "deaths" if metric_is_deaths else "damage taken"
+            passes.append((target_index, metric_is_deaths, tgt, zone_id))
 
-            def _cb(done, total, _label=metric_label, _boss=boss_name):
-                progress_bar.progress(done / total if total else 1.0)
-                status_area.caption(
-                    f"{_boss} — {_label}: analyzed {done}/{total} guilds…"
-                )
+    run = LiveMultiGuildRun(
+        guilds=guilds,
+        passes=passes,
+        start_dt=start_dt,
+        end_dt=end_dt,
+        difficulty=DIFFICULTY,
+        ignore_after_player_deaths=ignore_after_player_deaths,
+        min_attendance_frac=source_settings.get("min_attendance_frac"),
+        stop_at_first_kill=stop_at_first_kill,
+    )
+    run.start()
+    st.session_state["mg_live_run"] = run
+    st.session_state["mg_live_run_ctx"] = {
+        "guilds": guilds,
+        "targets": targets,
+        "ability_names": ability_names,
+        "guild_input_mode": guild_input_mode,
+        "rank_start": rank_start,
+        "rank_end": rank_end,
+        "min_attendance_frac": source_settings.get("min_attendance_frac"),
+    }
 
-            rows, skipped, stats = aggregate_guilds(
-                guilds,
-                boss_id=boss_id,
-                ability_id=ability_id,
-                start_dt=start_dt,
-                end_dt=end_dt,
-                zone_id=zone_id,
-                difficulty=DIFFICULTY,
-                metric_is_deaths=metric_is_deaths,
-                ignore_after_player_deaths=ignore_after_player_deaths,
-                min_attendance_frac=source_settings.get("min_attendance_frac"),
-                stop_at_first_kill=stop_at_first_kill,
-                progress_callback=_cb,
-            )
-            progress_bar.empty()
-            status_area.empty()
 
-            df = _build_multi_guild_table(rows, metric_is_deaths)
+def poll_live_multi_guild_run() -> bool:
+    """
+    Poll the active live run, if any, and render its live progress. Returns
+    True while a run is still in flight (caller should skip rendering the
+    results table this pass — the run just finished writing fresh ones, or
+    hasn't started producing any yet). Reruns itself (~2x/sec) via st.rerun()
+    while the background thread is alive, so a Stop click gets picked up
+    within about one polling interval.
+    """
+    run = st.session_state.get("mg_live_run")
+    if run is None:
+        return False
 
-            csv_buffer = io.StringIO()
-            writer = csv.writer(csv_buffer)
-            writer.writerow(
-                [boss_name, _ability_label(ability_id, ability_names)]
-            )
-            writer.writerow(df.columns.tolist())
-            for r in df.itertuples(index=False, name=None):
-                writer.writerow(r)
-            csv_bytes = csv_buffer.getvalue().encode("utf-8")
+    ctx = st.session_state["mg_live_run_ctx"]
+    snap = run.snapshot()
 
-            entries.append(
-                {
-                    "boss_name": boss_name,
-                    "ability_label": _ability_label(ability_id, ability_names),
-                    "metric_is_deaths": metric_is_deaths,
-                    "num_guilds": len(guilds),
-                    "num_players": len(rows),
-                    "df": df,
-                    "csv_bytes": csv_bytes,
-                    "skipped": skipped,
-                    "stats": stats,
-                    "min_attendance_frac": source_settings.get(
-                        "min_attendance_frac"
-                    ),
-                    "rank_start": rank_start,
-                    "rank_end": rank_end,
-                }
-            )
+    progress_bar = st.progress(0.0)
+    status_area = st.empty()
+    budget_area = st.empty()
+
+    num_guilds = max(1, len(ctx["guilds"]))
+    num_passes = max(1, snap["num_passes"])
+    frac = (snap["pass_index"] + snap["guilds_done_this_pass"] / num_guilds) / num_passes
+    progress_bar.progress(min(1.0, max(0.0, frac)))
+    status_area.caption(snap["message"])
+
+    if snap["budget"]:
+        rl = snap["budget"]
+        st.session_state["rate_limit"] = rl
+        remaining = rl["limit_per_hour"] - rl["points_spent"]
+        budget_area.caption(
+            f"💳 {int(rl['points_spent']):,} pts used this hour · "
+            f"{int(remaining):,} of {rl['limit_per_hour']:,} remaining"
+        )
+
+    if snap["state"] == "running":
+        if st.button("Stop", key="mg_live_stop"):
+            run.request_stop()
+            st.info("Stop requested — finishing the current chunk of guilds, then stopping.")
+
+    if run.is_alive():
+        time.sleep(0.5)
+        st.rerun()
+        return True
+
+    # Finished — either cleanly, stopped, budget-exhausted, or errored.
+    # Whatever passes DID complete get shown; nothing is silently discarded.
+    entries: list[dict] = []
+    for e in snap["entries"]:
+        tgt = ctx["targets"][e["target_index"]]
+        boss_name = tgt["boss_name"]
+        ability_label = _ability_label(tgt["ability_id"], ctx["ability_names"])
+        rows = e["rows"]
+        df = _build_multi_guild_table(rows, e["metric_is_deaths"])
+
+        csv_buffer = io.StringIO()
+        writer = csv.writer(csv_buffer)
+        writer.writerow([boss_name, ability_label])
+        writer.writerow(df.columns.tolist())
+        for r in df.itertuples(index=False, name=None):
+            writer.writerow(r)
+        csv_bytes = csv_buffer.getvalue().encode("utf-8")
+
+        entries.append(
+            {
+                "boss_name": boss_name,
+                "ability_label": ability_label,
+                "metric_is_deaths": e["metric_is_deaths"],
+                "num_guilds": len(ctx["guilds"]),
+                "num_players": len(rows),
+                "df": df,
+                "csv_bytes": csv_bytes,
+                "skipped": e["skipped"],
+                "stats": e.get("stats", {}),
+                "min_attendance_frac": ctx["min_attendance_frac"],
+                "guild_input_mode": ctx["guild_input_mode"],
+                "rank_start": ctx["rank_start"],
+                "rank_end": ctx["rank_end"],
+            }
+        )
 
     st.session_state["multi_guild_cache"] = {"entries": entries}
+    st.session_state["mg_live_run"] = None
+    st.session_state.pop("mg_live_run_ctx", None)
+
+    progress_bar.empty()
+    status_area.empty()
+
+    state = snap["state"]
+    if state == "done":
+        st.success("Run complete.")
+    elif state == "stopped":
+        st.warning(f"Stopped — {snap['message']}")
+    elif state == "budget_exhausted":
+        st.warning(snap["message"])
+    elif state == "error":
+        st.error(snap["message"])
+
+    return False
 
 
 def render_multi_guild_cache() -> None:
     cache = st.session_state.get("multi_guild_cache")
     if not cache or not cache.get("entries"):
         st.info(
-            "Pick a rank range above, choose a boss/ability, "
+            "Choose a guild list above, pick a boss/ability, "
             "then click **Generate CSV**."
         )
         return
@@ -394,9 +594,13 @@ def render_multi_guild_cache() -> None:
         st.markdown(
             f"#### {entry['boss_name']} — {entry['ability_label']} · {metric_text}"
         )
+        if entry.get("guild_input_mode") == "links":
+            guild_scope = "from the pasted guild list"
+        else:
+            guild_scope = f"(ranks {entry['rank_start']}–{entry['rank_end']})"
         st.success(
             f"{entry['num_players']} players across {entry['num_guilds']} "
-            f"guilds (ranks {entry['rank_start']}–{entry['rank_end']})."
+            f"guilds {guild_scope}."
         )
 
         stats = entry.get("stats", {})
@@ -421,9 +625,7 @@ def render_multi_guild_cache() -> None:
             ].str.contains(search, case=False, na=False)
             df = df[mask]
 
-        df = df.reset_index(drop=True)
-        df.index = range(1, len(df) + 1)
-        st.dataframe(df, use_container_width=True)
+        render_class_colored_table(df)
 
         st.download_button(
             "Download CSV",
@@ -462,27 +664,33 @@ def render_ranking_estimate(num_guilds: int, num_passes: int) -> None:
     c2.metric("Est. points needed", f"{plan['points']:,}")
     c3.metric("Est. time", est.format_duration(plan["total_seconds"]))
 
-    if rl is None:
-        st.caption(
-            "Open **Warcraft Logs API rate limit** above and click "
-            "**Check rate limit** to see whether your budget covers this run."
-        )
-        return
-
+    # "Est. time" above already includes any hourly-window waiting the run
+    # would need — even with no live rate-limit reading, plan() assumes the
+    # best case (a fresh budget right now) rather than silently reporting
+    # pure compute time for a run that obviously can't finish in one window.
     remaining = int(plan["remaining"])
     limit = plan["limit_per_hour"]
+    assumed_note = (
+        " — assumes a fresh budget right now; click **Check rate limit** "
+        "above for a number based on what you've actually got left"
+        if plan["budget_is_assumed"]
+        else ""
+    )
+
     if plan.get("enough_now"):
         st.success(
             f"Budget OK — ~{remaining:,} of {limit:,}/hr remain; this run needs "
             f"≈{plan['points']:,} points "
-            f"(compute {est.format_duration(plan['compute_seconds'])})."
+            f"(compute {est.format_duration(plan['compute_seconds'])})"
+            f"{assumed_note}."
         )
     elif plan.get("exceeds_hourly_budget"):
         st.warning(
             f"This needs ≈{plan['points']:,} points, more than the {limit:,}/hr "
             f"cap — it can't finish in one window. An overnight run would span "
             f"~{plan.get('windows_needed', 0)} hourly reset(s); "
-            f"total incl. waiting: {est.format_duration(plan['total_seconds'])}."
+            f"total incl. waiting: {est.format_duration(plan['total_seconds'])}"
+            f"{assumed_note}."
         )
     else:
         st.warning(
@@ -490,17 +698,19 @@ def render_ranking_estimate(num_guilds: int, num_passes: int) -> None:
             f"≈{plan['points']:,}. Wait "
             f"{est.format_duration(plan['wait_seconds'])} for reset, reduce the "
             f"range, or run overnight (total incl. waiting: "
-            f"{est.format_duration(plan['total_seconds'])})."
+            f"{est.format_duration(plan['total_seconds'])})"
+            f"{assumed_note}."
         )
 
 
 def _launch_overnight(job: dict) -> Path:
     """Write the job file and spawn overnight_run.py as a detached process."""
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    job_dir = (
-        PROJECT_ROOT / "output" / "overnight"
-        / f"{stamp}_r{job['rank_start']}-{job['rank_end']}"
-    )
+    if job.get("guild_input_mode") == "links":
+        suffix = f"links{len(job.get('manual_guilds') or [])}"
+    else:
+        suffix = f"r{job['rank_start']}-{job['rank_end']}"
+    job_dir = PROJECT_ROOT / "output" / "overnight" / f"{stamp}_{suffix}"
     job_dir.mkdir(parents=True, exist_ok=True)
     (job_dir / "job.json").write_text(
         json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -567,10 +777,12 @@ def _render_overnight_status(job_dir: str, status: dict) -> None:
 def render_overnight_launcher(job: dict) -> None:
     with st.expander("🌙 Overnight run (auto-resume through rate limits)"):
         st.caption(
-            "Runs headless in the background, pausing and re-checking the budget "
-            "every 5 min while it's exhausted, then resuming — so a range too big "
-            "for one hour just finishes overnight. It's a separate process, so it "
-            "keeps going even if you close this browser tab (leave the machine on)."
+            "Runs headless in the background. If it runs low on budget mid-range, "
+            "it sleeps straight through to the next hourly reset (WCL tells us "
+            "exactly when that is) rather than polling every few minutes, then "
+            "resumes automatically — so a range too big for one hour just finishes "
+            "overnight. It's a separate process, so it keeps going even if you "
+            "close this browser tab (leave the machine on)."
         )
         cols = st.columns([1, 1, 2])
         if cols[0].button("Launch overnight run", key="launch_overnight"):
@@ -593,20 +805,29 @@ def render_overnight_launcher(job: dict) -> None:
 
 
 if source_mode == "ranking":
-    st.markdown("### 3. Results — Top guilds (world ranking)")
-    st.caption(
-        "Guilds are ranked via Warcraft Logs' public fight rankings for the "
-        "selected boss. Privately-logged guilds have no public ranking and are "
-        "not included."
-    )
+    st.markdown("### 3. Results — Multi-guild queue")
 
-    # --- Live estimate + overnight launcher (both API-free to build) ----------
+    _guild_input_mode = source_settings.get("guild_input_mode", "rank")
     _rank_start = source_settings.get("rank_start", 1)
     _rank_end = source_settings.get("rank_end", 1)
-    _all_ranked = load_ranking(current_raid_file)
-    _num_guilds = sum(
-        1 for g in _all_ranked if _rank_start <= g["rank"] <= _rank_end
-    )
+    _manual_guilds = source_settings.get("manual_guilds") or []
+
+    if _guild_input_mode == "links":
+        st.caption(
+            "Guilds are the ones you pasted above, analyzed together in one queue."
+        )
+        _num_guilds = len(_manual_guilds)
+    else:
+        st.caption(
+            "Guilds come from a stored world-progress ranking for this raid — "
+            "slicing it to a rank range costs no API calls."
+        )
+        _all_ranked = load_ranking(current_raid_file)
+        _num_guilds = sum(
+            1 for g in _all_ranked if _rank_start <= g["rank"] <= _rank_end
+        )
+
+    # --- Live estimate + overnight launcher (both API-free to build) ----------
     _num_metrics = (1 if show_deaths else 0) + (1 if show_damage else 0)
     _num_passes = max(1, _num_metrics) * max(1, len(targets))
     render_ranking_estimate(_num_guilds, _num_passes)
@@ -617,8 +838,10 @@ if source_mode == "ranking":
     )
     _overnight_job = {
         "raid_file": current_raid_file,
+        "guild_input_mode": _guild_input_mode,
         "rank_start": _rank_start,
         "rank_end": _rank_end,
+        "manual_guilds": _manual_guilds,
         "metric": _metric_str,
         "start_date": start_date.isoformat(),
         "end_date": end_date.isoformat(),
@@ -630,8 +853,9 @@ if source_mode == "ranking":
     render_overnight_launcher(_overnight_job)
 
     if submitted:
-        compute_multi_guild_cache()
-    render_multi_guild_cache()
+        start_live_multi_guild_run()
+    if not poll_live_multi_guild_run():
+        render_multi_guild_cache()
     st.stop()
 
 
@@ -712,7 +936,7 @@ def compute_and_cache_results(
                 progress_codes[boss_id] = {
                     r["code"]
                     for r in reports_up_to_first_kill(
-                        reps, boss_id, DIFFICULTY, fights_fn=cached_boss_fights
+                        reps, boss_id, DIFFICULTY, fights_fn=get_boss_fights
                     )
                 }
 
@@ -801,16 +1025,18 @@ def compute_and_cache_results(
                 "no_data": True,
             }
 
-        # 4) Fetch fights for that (boss, date)
-        # ...
+        # 4) Fetch fights for that (boss, date) — cached per (report, boss),
+        #    shared with the fights fetch inside get_deaths/damage_taken above
+        #    instead of re-querying WCL for data we already have.
         try:
-            fights = get_boss_fights_for_report(
+            fights = get_boss_fights(
                 report_code=code,
                 boss_id=boss_id,
                 difficulty=DIFFICULTY,
             )
             wipes = [f for f in fights if not f.get("kill", False)]
         except Exception:
+            fights = []
             wipes = []
 
         # 5) Per-player pull (attendance) counts across the wipe fights,
@@ -818,7 +1044,7 @@ def compute_and_cache_results(
         player_pulls: dict[str, int] = {}
         if wipes:
             try:
-                actors_map = _fetch_player_actors(code)
+                actors_map = get_report_actors(code)
                 for f in wipes:
                     for actor_id in f.get("friendlyPlayers") or []:
                         name = actors_map.get(int(actor_id))
@@ -830,12 +1056,15 @@ def compute_and_cache_results(
         # 6) Class/spec per player for this report, so results tables can
         #    show "<Class> (<Spec>)" and color rows by class. Use every fight
         #    for this boss (not just wipes) so a clean-kill report still
-        #    yields class/spec data.
+        #    yields class/spec data. Cached per (report, boss) so multiple
+        #    ability targets on the same boss share one playerDetails query.
         player_class_spec: dict[str, tuple[str, str]] = {}
         if fights:
             try:
                 fight_ids_for_specs = [f["id"] for f in fights]
-                player_class_spec = get_player_class_specs(code, fight_ids_for_specs)
+                player_class_spec = get_report_class_specs(
+                    code, boss_id, fight_ids_for_specs
+                )
             except Exception:
                 player_class_spec = {}
 
@@ -1239,6 +1468,11 @@ if submitted and guild_id is not None:
     # Fresh fights cache per run, so the deaths and damage passes share the
     # first-kill scan instead of repeating it.
     reset_report_caches()
+    try:
+        _rl_before = get_rate_limit()
+    except Exception:
+        _rl_before = None
+
     if show_deaths:
         compute_and_cache_results(
             metric_is_deaths=True,
@@ -1249,6 +1483,19 @@ if submitted and guild_id is not None:
             metric_is_deaths=False,
             cache_key="damage",
         )
+
+    # Run summary — how many distinct reports this touched and roughly what
+    # it cost, so that's visible without having to check warcraftlogs.com.
+    _stats = get_report_cache_stats()
+    _summary_fields = {"Reports fetched": _stats["reports_fetched"]}
+    try:
+        _rl_after = get_rate_limit()
+        if _rl_before is not None:
+            _pts = round(_rl_after["points_spent"] - _rl_before["points_spent"], 2)
+            _summary_fields["Points spent"] = f"{_pts:,}"
+    except Exception:
+        pass
+    log_line(Result="run complete", **_summary_fields)
 
 # Always render whatever we have cached, based on current metric_mode.
 # When both metrics are shown, put them side by side — but only once the

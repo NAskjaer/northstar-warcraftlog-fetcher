@@ -4,25 +4,21 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 from .api_client import run_wcl_query
+from .log_utils import log_line
 
 
-def get_boss_fights_for_report(
-    report_code: str,
-    boss_id: int,
-    difficulty: int | None = 5,
-) -> List[Dict[str, Any]]:
+def fetch_all_fights(report_code: str) -> List[Dict[str, Any]]:
     """
-    Fetch all fights for a report, then filter by encounterID (boss) and difficulty.
+    Fetch every fight in a report (all bosses, all difficulties).
+
+    The underlying WCL query has no boss/difficulty filter — it always
+    returns the whole report — so this is safe to cache per report_code
+    alone (see report_cache.get_report_fights) and reuse across every
+    boss/ability target that touches this report.
 
     Returns a list of ReportFight dicts:
-    { id, name, encounterID, difficulty, kill, startTime, endTime }.
+    { id, name, encounterID, difficulty, kill, startTime, endTime, friendlyPlayers }.
     """
-    # DEBUG: what are we about to query for?
-    print(
-        f"  [deaths_fetcher] get_boss_fights_for_report("
-        f"report={report_code}, boss_id={boss_id}, difficulty={difficulty})"
-    )
-
     query = """
     query ($code: String!) {
       reportData {
@@ -46,9 +42,23 @@ def get_boss_fights_for_report(
     result = run_wcl_query(query, variables)
 
     try:
-        fights = result["data"]["reportData"]["report"]["fights"]
+        return result["data"]["reportData"]["report"]["fights"]
     except KeyError as exc:
         raise RuntimeError(f"Unexpected fights response from WCL: {result}") from exc
+
+
+def get_boss_fights_for_report(
+    report_code: str,
+    boss_id: int,
+    difficulty: int | None = 5,
+) -> List[Dict[str, Any]]:
+    """
+    Fetch all fights for a report, then filter by encounterID (boss) and difficulty.
+
+    Returns a list of ReportFight dicts:
+    { id, name, encounterID, difficulty, kill, startTime, endTime }.
+    """
+    fights = fetch_all_fights(report_code)
 
     # Filter client-side
     boss_fights: List[Dict[str, Any]] = []
@@ -59,12 +69,6 @@ def get_boss_fights_for_report(
             continue
         boss_fights.append(f)
 
-    print(
-        f"  [deaths_fetcher] Report {report_code}: "
-        f"{len(fights)} raw fights, {len(boss_fights)} boss fights "
-        f"(boss_id={boss_id}, difficulty={difficulty})"
-    )
-
     return boss_fights
 
 
@@ -74,6 +78,7 @@ def _fetch_death_events(
     end_time: int,
     fight_ids: list[int],
     ignore_after_player_deaths: int | None,
+    ability_id: int | None = None,
 ) -> List[Dict[str, Any]]:
     """
     Fetch death events for the given fights in [start_time, end_time].
@@ -83,6 +88,14 @@ def _fetch_death_events(
       - restricts to the specified fight IDs
       - paginates over nextPageTimestamp
       - optionally applies wipeCutoff when ignore_after_player_deaths > 0
+
+    If ``ability_id`` is given, it's passed server-side as WCL's abilityID
+    filter. Measured live against the API: for a report with 148 raw death
+    events, the unfiltered fetch cost 22.6 points while the same fetch with
+    abilityID cost 1.0 point and returned byte-identical results to the
+    client-side match this module used to do alone (abilityGameID == id OR
+    killingAbilityGameID == id) — verified across several abilities. The
+    caller still re-applies that OR match locally as a cheap no-op safety net.
     """
     query = """
     query (
@@ -90,7 +103,8 @@ def _fetch_death_events(
       $start: Float!,
       $end: Float!,
       $fightIDs: [Int!],
-      $wipeCutoff: Int
+      $wipeCutoff: Int,
+      $abilityId: Float
     ) {
       reportData {
         report(code: $code) {
@@ -100,6 +114,7 @@ def _fetch_death_events(
             dataType: Deaths
             fightIDs: $fightIDs
             wipeCutoff: $wipeCutoff
+            abilityID: $abilityId
           ) {
             data
             nextPageTimestamp
@@ -125,6 +140,7 @@ def _fetch_death_events(
             "end": float(end_time),
             "fightIDs": fight_ids,
             "wipeCutoff": cutoff,
+            "abilityId": float(ability_id) if ability_id is not None else None,
         }
 
         result = run_wcl_query(query, variables)
@@ -185,7 +201,6 @@ def _fetch_player_actors(report_code: str) -> Dict[int, str]:
             continue
         id_to_name[int(actor_id)] = str(name)
 
-    print(f"  [deaths_fetcher] Report {report_code}: loaded {len(id_to_name)} actors.")
     return id_to_name
 
 
@@ -196,6 +211,7 @@ def get_deaths_by_player_for_ability(
     difficulty: int | None = 5,
     wipes_only: bool = True,
     ignore_after_player_deaths: int | None = None,
+    guild_name: str | None = None,
 ) -> List[Dict[str, Any]]:
     """
     For a single report, return total deaths BY PLAYER for a given boss + ability.
@@ -215,47 +231,47 @@ def get_deaths_by_player_for_ability(
         fight is one of the boss fights
         (if ability_id is not None)
             abilityGameID == ability_id OR killingAbilityGameID == ability_id
+
+    ``guild_name`` is purely cosmetic — it's only used to prefix the summary
+    log line, and is omitted there when the caller doesn't know it (e.g. the
+    single-guild UI flow, which never fetches a guild's display name).
     """
-    fights = get_boss_fights_for_report(report_code, boss_id, difficulty)
+    # Deferred import: report_cache imports the raw fetchers from this module,
+    # so importing it at module scope here would be circular.
+    from . import report_cache
+
+    fights = report_cache.get_boss_fights(report_code, boss_id, difficulty)
 
     if not fights:
-        print(
-            f"  [deaths_fetcher] Report {report_code}: "
-            f"no fights found for boss {boss_id} (difficulty={difficulty})."
-        )
+        log_line(Guild=guild_name, Report=report_code, Boss=boss_id,
+                  Result="no fights for this boss")
         return []
 
     # Optionally keep only wipes (non-kill pulls)
     if wipes_only:
         fights = [f for f in fights if not f.get("kill")]
-        print(
-            f"  [deaths_fetcher] Report {report_code}: "
-            f"{len(fights)} wipe fights after wipes_only filter "
-            f"(boss_id={boss_id})."
-        )
         if not fights:
+            log_line(Guild=guild_name, Report=report_code, Boss=boss_id,
+                      Result="no wipe fights (kill-only report)")
             return []
 
     fight_ids = [f["id"] for f in fights]
     start_time = min(f["startTime"] for f in fights)
     end_time = max(f["endTime"] for f in fights)
 
-    # Fetch death events for these fights, with optional wipeCutoff
-    death_events = _fetch_death_events(
+    # Fetch death events for these fights, with optional wipeCutoff. When a
+    # specific ability is targeted, it's applied server-side too — far
+    # cheaper than fetching every death in the window (see report_cache).
+    death_events = report_cache.get_death_events(
         report_code=report_code,
+        boss_id=boss_id,
+        difficulty=difficulty,
+        fight_ids=fight_ids,
         start_time=start_time,
         end_time=end_time,
-        fight_ids=fight_ids,
-        ignore_after_player_deaths=ignore_after_player_deaths,
+        wipe_cutoff=ignore_after_player_deaths,
+        ability_id=ability_id,
     )
-
-    print(
-        f"  [deaths_fetcher] Report {report_code}: "
-        f"{len(death_events)} raw death events in time window "
-        f"(boss_id={boss_id}, ability_id={ability_id})"
-    )
-    if death_events:
-        print(f"    Sample death event: {death_events[0]}")
 
     # Filter down to:
     #   - the boss fights
@@ -279,17 +295,13 @@ def get_deaths_by_player_for_ability(
 
         filtered.append(ev)
 
-    print(
-        f"  [deaths_fetcher] Report {report_code}: "
-        f"{len(filtered)} events for ability {ability_id} in boss fights "
-        f"(boss_id={boss_id})"
-    )
-
     if not filtered:
+        log_line(Guild=guild_name, Report=report_code, Boss=boss_id,
+                  Wipes=len(fights), Ability=ability_id, Deaths=0)
         return []
 
     # Map actor IDs to player names
-    actors_map = _fetch_player_actors(report_code)
+    actors_map = report_cache.get_report_actors(report_code)
 
     # Count deaths per player (targetID)
     deaths_by_player: Dict[str, int] = {}
@@ -300,10 +312,10 @@ def get_deaths_by_player_for_ability(
         name = actors_map.get(int(target_id), f"ID-{target_id}")
         deaths_by_player[name] = deaths_by_player.get(name, 0) + 1
 
-    print(
-        f"  [deaths_fetcher] Report {report_code}: "
-        f"{sum(deaths_by_player.values())} deaths across {len(deaths_by_player)} "
-        f"players for ability {ability_id}."
+    log_line(
+        Guild=guild_name, Report=report_code, Boss=boss_id,
+        Wipes=len(fights), Ability=ability_id,
+        Deaths=f"{sum(deaths_by_player.values())} across {len(deaths_by_player)} players",
     )
 
     # Convert to sorted list

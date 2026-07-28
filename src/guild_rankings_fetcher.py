@@ -74,6 +74,43 @@ def get_encounter_zone_id(encounter_id: int) -> Optional[int]:
         return None
 
 
+_GUILD_INFO_QUERY = """
+query ($id: Int!) {
+  guildData {
+    guild(id: $id) {
+      name
+      server { name region { compactName } }
+    }
+  }
+}
+"""
+
+
+def get_guild_info(guild_id: int) -> Optional[Dict[str, Any]]:
+    """
+    Resolve a guild ID to its display name/server/region (~1 point, measured
+    live). Used for the "by guild links" input mode, where all the app
+    starts with is a numeric ID parsed out of a pasted URL — the stored
+    world-progress ranking already carries real names for free, so this
+    lookup is only needed for manually-entered guilds. Returns None if the
+    guild doesn't exist or the lookup fails.
+    """
+    try:
+        result = run_wcl_query(_GUILD_INFO_QUERY, {"id": guild_id})
+        guild = result["data"]["guildData"]["guild"]
+        if not guild:
+            return None
+        server = guild.get("server") or {}
+        region = (server.get("region") or {}).get("compactName", "")
+        return {
+            "guild_name": guild.get("name") or f"Guild {guild_id}",
+            "server_name": server.get("name", ""),
+            "region": region,
+        }
+    except Exception:
+        return None
+
+
 def get_ranked_guilds(
     encounter_id: int,
     *,

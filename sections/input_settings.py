@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone, date as date_cls
 from typing import List, Dict, Any, Tuple
 
 import streamlit as st
 
 from src import boss_config
+from src.guild_rankings_fetcher import get_guild_info
+from src.guild_rankings_store import load_ranking
+from src.guild_url import parse_guild_id_from_url
 
 DIFFICULTY: int = 5  # always Mythic
 
@@ -93,6 +97,33 @@ def _build_targets_from_blocks(
     return targets
 
 
+def _label_aligned_row(key: str) -> None:
+    """
+    Reserve two lines of label height for every widget in a keyed row.
+
+    st.columns() sizes each column to its own content, so when one column's
+    label wraps to two lines (e.g. "Ignore events after player deaths" at
+    narrower/non-wide-mode widths) while its neighbors' labels stay on one
+    line, the input boxes below end up at different heights. Reserving
+    two-line height on every label in the row — even ones that don't need
+    it — keeps every input aligned to the tallest label's bottom edge
+    regardless of window width, at the cost of a little empty space under
+    short labels.
+    """
+    st.markdown(
+        f"""
+        <style>
+          div.st-key-{key} [data-testid="stWidgetLabel"] {{
+            min-height: 2.5rem;
+            display: flex;
+            align-items: flex-end;
+          }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def _render_ignore_input() -> int:
     """Render the shared 'Ignore events after player deaths' number input."""
     return st.number_input(
@@ -164,8 +195,20 @@ def render_input_settings() -> Tuple[
         
         # Reload configuration for current raid
         ability_names, boss_options = _reload_boss_config()
-        
+
         _init_boss_blocks()
+
+        # Highest rank actually stored for this raid's guild_rankings file —
+        # caps "Rank from"/"Rank to" below so the range can't reach past
+        # guilds that were never collected. Clamp any already-set session
+        # state *before* the widgets render, since Streamlit raises if a
+        # widget's current value falls outside a newly-set max_value.
+        _stored_ranking = load_ranking(_get_current_raid_file())
+        max_stored_rank = max((g["rank"] for g in _stored_ranking), default=0)
+        if max_stored_rank >= 1:
+            for _rank_key in ("ranking_rank_start", "ranking_rank_end"):
+                if st.session_state.get(_rank_key, 0) > max_stored_rank:
+                    st.session_state[_rank_key] = max_stored_rank
 
         st.markdown("---")
 
@@ -174,106 +217,240 @@ def render_input_settings() -> Tuple[
         # ------------------------------------------------------------------
         source_mode = st.radio(
             "Guild source",
-            options=["Single guild (URL)", "Top guilds (world ranking)"],
+            options=["Single guild (URL)", "Multi-guild queue"],
             index=0,
             horizontal=True,
             key="guild_source_mode",
             help=(
-                "Analyze one guild by URL, or aggregate the top guilds for the "
-                "selected boss using Warcraft Logs' public rankings."
+                "Analyze one guild by URL, or queue up many guilds at once — "
+                "either the top guilds by world rank, or a list of specific "
+                "guild URLs."
             ),
         )
-        source_is_ranking = source_mode.startswith("Top guilds")
+        source_is_multi = source_mode.startswith("Multi-guild")
 
         # Defaults; overwritten below depending on mode.
         guild_url = ""
         rank_start = 1
         rank_end = 50
         min_attendance_frac: float | None = None
+        guild_input_mode = "rank"
+        manual_guilds: List[Dict[str, Any]] = []
 
-        if not source_is_ranking:
-            col_url, col_ignore = st.columns([2, 1])
-            with col_url:
-                guild_url = st.text_input(
-                    "Guild URL",
-                    placeholder="https://www.warcraftlogs.com/guild/id/235490",
-                    help="Full Warcraft Logs guild URL. The app extracts the guild ID from this.",
-                )
-            with col_ignore:
-                ignore_after_player_deaths_raw = _render_ignore_input()
+        if not source_is_multi:
+            _label_aligned_row("single_guild_row")
+            with st.container(key="single_guild_row"):
+                col_url, col_ignore = st.columns([2, 1])
+                with col_url:
+                    guild_url = st.text_input(
+                        "Guild URL",
+                        placeholder="https://www.warcraftlogs.com/guild/id/235490",
+                        help="Full Warcraft Logs guild URL. The app extracts the guild ID from this.",
+                    )
+                with col_ignore:
+                    ignore_after_player_deaths_raw = _render_ignore_input()
         else:
-            st.markdown(
-                "Guilds come from a stored world-progress ranking for this "
-                "raid. Set the rank range below and go."
-            )
-
-            col_start, col_end, col_ignore = st.columns([1, 1, 1])
-            with col_start:
-                rank_start = int(
-                    st.number_input(
-                        "Rank from",
-                        min_value=1,
-                        step=1,
-                        value=1,
-                        key="ranking_rank_start",
-                        help="Keep only guilds with world rank ≥ this.",
-                    )
-                )
-            with col_end:
-                rank_end = int(
-                    st.number_input(
-                        "Rank to",
-                        min_value=1,
-                        step=1,
-                        value=50,
-                        key="ranking_rank_end",
-                        help="Keep only guilds with world rank ≤ this.",
-                    )
-                )
-            with col_ignore:
-                ignore_after_player_deaths_raw = _render_ignore_input()
-
-            if rank_end < rank_start:
-                rank_start, rank_end = rank_end, rank_start
-            _n_guilds = rank_end - rank_start + 1
-            st.caption(
-                f"From the stored ranking, analyze guilds ranked "
-                f"**{rank_start}–{rank_end}** over the date range above. Each "
-                "guild's pull count comes from its logs in that range, so pick a "
-                "range that covers the progression. "
-                f"⏱️ Roughly ~{max(1, _n_guilds * 15 // 60)}–"
-                f"{max(1, _n_guilds * 25 // 60)} min for {_n_guilds} guilds; "
-                "large ranges are slower and may hit Warcraft Logs rate limits."
-            )
-
-            col_filt, col_pct = st.columns([2, 1])
-            with col_filt:
-                attendance_filter_on = st.checkbox(
-                    "Only players with high attendance",
-                    value=True,
-                    key="ranking_attendance_filter",
+            with st.container(border=True):
+                input_mode_label = st.segmented_control(
+                    "Guild list",
+                    options=["By world rank", "By guild links"],
+                    default="By world rank",
+                    key="mg_input_mode",
                     help=(
-                        "Drop players who attended fewer than the chosen "
-                        "percentage of their guild's pulls-for-kill (wipe pulls "
-                        "in the analysed report). Prevents low-attendance "
-                        "players from looking 'clean' just for sitting out."
+                        "**By world rank** — pull guilds from the stored "
+                        "world-progress ranking for this raid.\n\n"
+                        "**By guild links** — paste specific guild URLs to "
+                        "queue together, regardless of rank."
                     ),
                 )
-            with col_pct:
-                attendance_pct = int(
-                    st.number_input(
-                        "Min attendance %",
-                        min_value=1,
-                        max_value=100,
-                        step=5,
-                        value=80,
-                        key="ranking_attendance_pct",
-                        disabled=not attendance_filter_on,
-                    )
+                guild_input_mode = (
+                    "rank" if input_mode_label == "By world rank" else "links"
                 )
-            min_attendance_frac = (
-                attendance_pct / 100.0 if attendance_filter_on else None
-            )
+                st.write("")
+
+                if guild_input_mode == "rank":
+                    _rank_max = max_stored_rank if max_stored_rank >= 1 else None
+                    _label_aligned_row("rank_row")
+                    with st.container(key="rank_row"):
+                        col_start, col_end, col_ignore = st.columns(3)
+                        with col_start:
+                            rank_start = int(
+                                st.number_input(
+                                    "Rank from",
+                                    min_value=1,
+                                    max_value=_rank_max,
+                                    step=1,
+                                    value=1,
+                                    key="ranking_rank_start",
+                                    help=(
+                                        f"Keep only guilds with world rank ≥ this "
+                                        f"(max {max_stored_rank} stored)."
+                                        if _rank_max
+                                        else "Keep only guilds with world rank ≥ this."
+                                    ),
+                                )
+                            )
+                        with col_end:
+                            rank_end = int(
+                                st.number_input(
+                                    "Rank to",
+                                    min_value=1,
+                                    max_value=_rank_max,
+                                    step=1,
+                                    value=min(50, _rank_max) if _rank_max else 50,
+                                    key="ranking_rank_end",
+                                    help=(
+                                        f"Keep only guilds with world rank ≤ this "
+                                        f"(max {max_stored_rank} stored)."
+                                        if _rank_max
+                                        else "Keep only guilds with world rank ≤ this."
+                                    ),
+                                )
+                            )
+                        with col_ignore:
+                            ignore_after_player_deaths_raw = _render_ignore_input()
+
+                    if rank_end < rank_start:
+                        rank_start, rank_end = rank_end, rank_start
+                    _n_guilds = rank_end - rank_start + 1
+                    st.caption(
+                        f"From the stored world-progress ranking, analyze guilds "
+                        f"ranked **{rank_start}–{rank_end}** over the date range "
+                        "above — zero extra API calls to build the list. "
+                        f"⏱️ Roughly ~{max(1, _n_guilds * 15 // 60)}–"
+                        f"{max(1, _n_guilds * 25 // 60)} min for {_n_guilds} "
+                        "guilds; large ranges are slower and may hit Warcraft "
+                        "Logs rate limits."
+                    )
+                else:
+                    _label_aligned_row("links_row")
+                    with st.container(key="links_row"):
+                        col_links, col_ignore = st.columns([2, 1])
+                        with col_links:
+                            guild_links_raw = st.text_area(
+                                "Guild URLs (one per line)",
+                                height=140,
+                                placeholder=(
+                                    "https://www.warcraftlogs.com/guild/id/235490\n"
+                                    "https://www.warcraftlogs.com/guild/id/12345"
+                                ),
+                                key="mg_guild_links_raw",
+                                help="Paste one Warcraft Logs guild URL per line.",
+                            )
+                        with col_ignore:
+                            ignore_after_player_deaths_raw = _render_ignore_input()
+
+                    parse_errors: List[str] = []
+                    parsed_ids: List[int] = []
+                    for i, line in enumerate(guild_links_raw.splitlines(), start=1):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        gid = parse_guild_id_from_url(line)
+                        if gid is None:
+                            parse_errors.append(
+                                f"Line {i}: couldn't parse a guild ID from “{line}”."
+                            )
+                            continue
+                        parsed_ids.append(gid)
+
+                    # Resolve real guild names/servers, preferring the free
+                    # local lookup first: many pasted guilds are already in
+                    # the stored world-progress ranking, so check there
+                    # (zero API calls) before falling back to a live lookup
+                    # (~1 pt each, measured live) for anything not found.
+                    # Cached in session_state either way, so re-parsing on
+                    # every rerun (any widget interaction while this tab is
+                    # open) only ever resolves a given guild ID once.
+                    name_cache: Dict[int, Dict[str, Any]] = st.session_state.setdefault(
+                        "mg_guild_info_cache", {}
+                    )
+                    new_ids = [gid for gid in parsed_ids if gid not in name_cache]
+                    if new_ids:
+                        stored_by_id = {
+                            g["guild_id"]: g
+                            for g in load_ranking(_get_current_raid_file())
+                        }
+                        still_unknown = []
+                        for gid in new_ids:
+                            stored = stored_by_id.get(gid)
+                            if stored:
+                                name_cache[gid] = {
+                                    "guild_name": stored.get("guild_name", f"Guild {gid}"),
+                                    "server_name": stored.get("server_name", ""),
+                                    "region": stored.get("region", ""),
+                                }
+                            else:
+                                still_unknown.append(gid)
+
+                        if still_unknown:
+                            with st.spinner(f"Looking up {len(still_unknown)} guild name(s)…"):
+                                with ThreadPoolExecutor(max_workers=8) as ex:
+                                    for gid, info in zip(
+                                        still_unknown, ex.map(get_guild_info, still_unknown)
+                                    ):
+                                        name_cache[gid] = info or {
+                                            "guild_name": f"Guild {gid}",
+                                            "server_name": "",
+                                            "region": "",
+                                        }
+
+                    for gid in parsed_ids:
+                        info = name_cache[gid]
+                        manual_guilds.append(
+                            {
+                                "rank": len(manual_guilds) + 1,
+                                "guild_id": gid,
+                                "guild_name": info["guild_name"],
+                                "server_name": info["server_name"],
+                                "region": info["region"],
+                            }
+                        )
+
+                    if parse_errors:
+                        st.warning("  \n".join(parse_errors))
+                    _n_guilds = len(manual_guilds)
+                    if _n_guilds:
+                        st.caption(
+                            f"**{_n_guilds}** guild(s) queued. Each guild's pull "
+                            "count comes from its logs in the date range above. "
+                            f"⏱️ Roughly ~{max(1, _n_guilds * 15 // 60)}–"
+                            f"{max(1, _n_guilds * 25 // 60)} min."
+                        )
+                    else:
+                        st.caption("Paste at least one guild URL above to queue it.")
+
+                st.divider()
+
+                col_filt, col_pct = st.columns([2, 1])
+                with col_filt:
+                    attendance_filter_on = st.checkbox(
+                        "Only players with high attendance",
+                        value=True,
+                        key="ranking_attendance_filter",
+                        help=(
+                            "Drop players who attended fewer than the chosen "
+                            "percentage of their guild's pulls-for-kill (wipe "
+                            "pulls in the analysed report). Prevents "
+                            "low-attendance players from looking 'clean' just "
+                            "for sitting out."
+                        ),
+                    )
+                with col_pct:
+                    attendance_pct = int(
+                        st.number_input(
+                            "Min attendance %",
+                            min_value=1,
+                            max_value=100,
+                            step=5,
+                            value=50,
+                            key="ranking_attendance_pct",
+                            disabled=not attendance_filter_on,
+                        )
+                    )
+                min_attendance_frac = (
+                    attendance_pct / 100.0 if attendance_filter_on else None
+                )
 
         # ------------------------------------------------------------------
         # Date range
@@ -595,9 +772,11 @@ def render_input_settings() -> Tuple[
         ignore_after_player_deaths = None
 
     source_settings: Dict[str, Any] = {
-        "mode": "ranking" if source_is_ranking else "single",
+        "mode": "ranking" if source_is_multi else "single",
+        "guild_input_mode": guild_input_mode,
         "rank_start": rank_start,
         "rank_end": rank_end,
+        "manual_guilds": manual_guilds,
         "min_attendance_frac": min_attendance_frac,
     }
 

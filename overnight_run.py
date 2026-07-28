@@ -3,10 +3,11 @@
 Headless overnight runner for multi-guild (ranking-mode) CSVs.
 
 Runs the same aggregation as the Streamlit "Top guilds" tab, but survives the
-Warcraft Logs hourly points budget: when it runs low it sleeps and re-checks
-every few minutes, then resumes, so a big rank range finishes overnight instead
-of failing. Progress is checkpointed, so a crash/reboot continues where it left
-off if you re-run the same job directory.
+Warcraft Logs hourly points budget: when it runs low it sleeps straight through
+to the next hourly reset (computed from WCL's own countdown) and resumes, so a
+big rank range finishes overnight instead of failing. Progress is checkpointed,
+so a crash/reboot continues where it left off if you re-run the same job
+directory.
 
 Usage (job file, as written by the app's "Launch overnight run" button):
     python overnight_run.py --job output/overnight/<id>/job.json
@@ -99,7 +100,10 @@ def main() -> None:
     p.add_argument("--min-attendance", dest="min_attendance", type=float,
                    default=0.8, help="Drop players below this fraction of pulls.")
     p.add_argument("--poll", type=int, default=300,
-                   help="Seconds between budget re-checks while waiting.")
+                   help="Seconds between retries if a budget check itself fails "
+                        "outright (e.g. a hard 429). Once budget is confirmed "
+                        "low, the run instead sleeps straight through to WCL's "
+                        "own hourly reset countdown, so this rarely matters.")
     p.add_argument("--chunk-size", dest="chunk_size", type=int, default=20,
                    help="Guilds analysed between budget checks.")
     args = p.parse_args()

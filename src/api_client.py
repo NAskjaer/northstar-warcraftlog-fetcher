@@ -1,5 +1,6 @@
 # src/api_client.py
 import os
+import threading
 import time
 
 # Make Python's SSL use the operating-system certificate store *before* requests
@@ -27,6 +28,40 @@ _token_cache: dict[str, float | str | None] = {
     "access_token": None,
     "expires_at": 0.0,
 }
+
+# Last retry/pause event from run_wcl_query, if any — lets the UI show a
+# live "currently throttled, retrying..." indicator instead of this only
+# ever showing up in the terminal. Plain module state (no Streamlit import
+# here) so it's usable from the CLI/overnight paths too.
+_retry_status_lock = threading.Lock()
+_retry_status: dict[str, object] | None = None
+
+
+def _set_retry_status(message: str) -> None:
+    global _retry_status
+    with _retry_status_lock:
+        _retry_status = {"message": message, "at": time.time()}
+
+
+def _clear_retry_status() -> None:
+    global _retry_status
+    with _retry_status_lock:
+        _retry_status = None
+
+
+def get_retry_status(max_age_seconds: float = 60.0) -> dict[str, object] | None:
+    """
+    The most recent throttle/retry event, if any and if recent enough.
+    Returns None once a request has since succeeded (which clears it) or
+    the event is older than ``max_age_seconds`` (a stale blip from a while
+    ago isn't "currently happening").
+    """
+    with _retry_status_lock:
+        if _retry_status is None:
+            return None
+        if time.time() - _retry_status["at"] > max_age_seconds:
+            return None
+        return dict(_retry_status)
 
 
 def get_wcl_token() -> str:
@@ -82,6 +117,30 @@ def get_wcl_token() -> str:
     _token_cache["expires_at"] = now + expires_in
 
     return access_token
+
+_RETRYABLE_ERROR_MARKERS = (
+    "rate limit",
+    "429",
+    "points budget",
+    "timing out",
+    "failing to connect",
+)
+
+
+def is_retryable_error(message: str) -> bool:
+    """
+    True if an error message looks like a transient WCL failure (rate limit
+    exhaustion, or a network timeout/connection failure after retries) —
+    the exact wording run_wcl_query raises for those cases — rather than a
+    genuine data result (e.g. "no public logs in range").
+
+    Used by callers that track per-guild "was this fully processed" state
+    (the overnight runner) to tell "we don't actually know, try again later"
+    apart from "we checked and there's nothing here".
+    """
+    text = message.lower()
+    return any(marker in text for marker in _RETRYABLE_ERROR_MARKERS)
+
 
 def get_rate_limit() -> dict:
     """
@@ -142,16 +201,27 @@ def run_wcl_query(
             )
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
             if attempt >= max_retries:
+                msg = f"Warcraft Logs API unreachable after {max_retries + 1} attempts — giving up."
+                print(f"  [FAILED] {msg}")
+                _set_retry_status(msg)
                 raise RuntimeError(
                     "Warcraft Logs API kept timing out / failing to connect "
                     f"after {max_retries + 1} attempts: {exc}"
                 ) from exc
-            wait = min(2 ** attempt, 8)  # 1, 2, 4, capped 8
+            wait = min(2 ** attempt, 5)  # 1, 2, 4, capped 5
+            msg = (f"Network hiccup ({type(exc).__name__}) — retrying in {wait}s "
+                   f"(attempt {attempt + 1}/{max_retries})...")
+            print(f"  [RETRY] {msg}")
+            _set_retry_status(msg)
             _time.sleep(wait)
             continue
 
         if resp.status_code == 429:
             if attempt >= max_retries:
+                msg = ("Rate limit (429) did not clear after retries — "
+                       "hourly points budget is exhausted.")
+                print(f"  [PAUSED] {msg}")
+                _set_retry_status(msg)
                 raise RuntimeError(
                     "Warcraft Logs rate limit hit (HTTP 429) and did not clear "
                     "after retries. The hourly points budget is exhausted. The "
@@ -164,9 +234,13 @@ def run_wcl_query(
             # a single run will help — surface a clear error instead.
             retry_after = resp.headers.get("Retry-After")
             if retry_after and retry_after.isdigit():
-                wait = min(int(retry_after), 10)
+                wait = min(int(retry_after), 5)
             else:
-                wait = min(2 ** attempt, 8)  # 1, 2, 4, capped 8
+                wait = min(2 ** attempt, 5)  # 1, 2, 4, capped 5
+            msg = (f"Rate limited (429) — pausing {wait}s before retry "
+                   f"(attempt {attempt + 1}/{max_retries})...")
+            print(f"  [PAUSED] {msg}")
+            _set_retry_status(msg)
             _time.sleep(wait)
             continue
 
@@ -179,6 +253,7 @@ def run_wcl_query(
                 print(err)
             raise RuntimeError("Warcraft Logs API error — see messages above.")
 
+        _clear_retry_status()
         return result
 
     # Unreachable, but keeps type-checkers happy.

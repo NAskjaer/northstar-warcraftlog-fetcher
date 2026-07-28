@@ -16,87 +16,26 @@ which lets us drop players who attended far fewer pulls than their guild
 """
 from __future__ import annotations
 
-import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from .api_client import is_retryable_error
 from .calendar_fetcher import fetch_logs_for_guild, reports_up_to_first_kill
-from .deaths_fetcher import (
-    get_boss_fights_for_report,
-    _fetch_death_events,
-    _fetch_player_actors,
-)
-from .damage_taken_fetcher import _fetch_damage_taken_events
+from .log_utils import log_line
+from . import report_cache
+from .report_cache import reset_report_caches
 
+# Re-exported for existing importers (ui/app.py, overnight.py) — the actual
+# per-run cache now lives in report_cache so it's shared with the
+# single-guild flow instead of duplicating fetches across the two paths.
+cached_boss_fights = report_cache.get_boss_fights
 
-# --------------------------------------------------------------------------
-# Per-run caches to avoid re-fetching the same data across metric/ability
-# passes. Small, reusable data only: boss fights, actor maps, and the full
-# death-event set per report (deaths are cheap and filtered by ability
-# locally). Damage events are NOT cached — they're filtered server-side by
-# abilityID, so per-ability fetches are already the cheap path.
-#
-# Call reset_report_caches() at the start of each aggregation run.
-# --------------------------------------------------------------------------
-_cache_lock = threading.Lock()
-_fights_cache: Dict[tuple, List[Dict[str, Any]]] = {}
-_actors_cache: Dict[str, Dict[int, str]] = {}
-_deaths_cache: Dict[tuple, List[Dict[str, Any]]] = {}
-
-
-def reset_report_caches() -> None:
-    """Clear the per-run report caches (call once before an aggregation run)."""
-    with _cache_lock:
-        _fights_cache.clear()
-        _actors_cache.clear()
-        _deaths_cache.clear()
-
-
-def cached_boss_fights(
-    code: str, boss_id: int, difficulty: int | None = 5
-) -> List[Dict[str, Any]]:
-    """Boss fights for a report, memoised for the current run (see reset above)."""
-    key = (code, boss_id, difficulty)
-    with _cache_lock:
-        if key in _fights_cache:
-            return _fights_cache[key]
-    val = get_boss_fights_for_report(code, boss_id, difficulty)
-    with _cache_lock:
-        _fights_cache[key] = val
-    return val
-
-
-def _cached_actors(code: str) -> Dict[int, str]:
-    with _cache_lock:
-        if code in _actors_cache:
-            return _actors_cache[code]
-    val = _fetch_player_actors(code)
-    with _cache_lock:
-        _actors_cache[code] = val
-    return val
-
-
-def _cached_death_events(
-    code: str,
-    start_time: int,
-    end_time: int,
-    fight_ids: List[int],
-    boss_id: int,
-    difficulty: int,
-    ignore_after_player_deaths: Optional[int],
-) -> List[Dict[str, Any]]:
-    # Keyed by what determines the fetch (window derives from boss+diff fights).
-    key = (code, boss_id, difficulty, ignore_after_player_deaths)
-    with _cache_lock:
-        if key in _deaths_cache:
-            return _deaths_cache[key]
-    val = _fetch_death_events(
-        code, start_time, end_time, fight_ids, ignore_after_player_deaths
-    )
-    with _cache_lock:
-        _deaths_cache[key] = val
-    return val
+# Per-guild report concurrency once the report list is fixed (after any
+# first-kill scan, which stays sequential — see _analyse_one_guild). Guilds
+# themselves also run concurrently via aggregate_guilds' own pool, so total
+# in-flight threads can be guild-workers × this; kept modest for that reason.
+_REPORT_WORKERS = 6
 
 
 def _best_reports_in_range(
@@ -121,6 +60,13 @@ def _best_reports_in_range(
     return [max(reps, key=_duration) for reps in by_date.values()]
 
 
+def _guild_label(guild: Dict[str, Any]) -> str:
+    """'Northstar (235490)' for log lines — name alone is ambiguous/blank
+    for "by guild links" entries before their name lookup resolves."""
+    name = guild.get("guild_name") or f"Guild {guild.get('guild_id')}"
+    return f"{name} ({guild.get('guild_id')})"
+
+
 def _analyse_report(
     report_code: str,
     *,
@@ -137,7 +83,7 @@ def _analyse_report(
     per-player values, per-player pulls, and the wipe-pull count, or None if the
     boss isn't present in this report.
     """
-    fights = cached_boss_fights(report_code, boss_id, difficulty)
+    fights = report_cache.get_boss_fights(report_code, boss_id, difficulty)
     if not fights:
         return None
     # Wipes only, to match the rest of the app.
@@ -149,7 +95,8 @@ def _analyse_report(
     start_time = min(f["startTime"] for f in fights)
     end_time = max(f["endTime"] for f in fights)
 
-    actors = _cached_actors(report_code)
+    actors = report_cache.get_report_actors(report_code)
+    class_specs = report_cache.get_report_class_specs(report_code, boss_id, fight_ids)
 
     # Per-player pulls (attendance) + total wipe pulls in this report.
     pulls: Dict[str, int] = {}
@@ -164,14 +111,15 @@ def _analyse_report(
     hits: Dict[str, int] = {}
 
     if metric_is_deaths:
-        events = _cached_death_events(
-            report_code,
-            start_time,
-            end_time,
-            fight_ids,
-            boss_id,
-            difficulty,
-            ignore_after_player_deaths,
+        events = report_cache.get_death_events(
+            report_code=report_code,
+            boss_id=boss_id,
+            difficulty=difficulty,
+            fight_ids=fight_ids,
+            start_time=start_time,
+            end_time=end_time,
+            wipe_cutoff=ignore_after_player_deaths,
+            ability_id=ability_id,
         )
         for ev in events:
             if ev.get("type") != "death":
@@ -189,8 +137,14 @@ def _analyse_report(
             name = actors.get(int(target_id), f"ID-{target_id}")
             values[name] = values.get(name, 0) + 1
     else:
-        events = _fetch_damage_taken_events(
-            report_code, start_time, end_time, fight_ids, ability_id
+        events = report_cache.get_damage_events(
+            report_code=report_code,
+            boss_id=boss_id,
+            difficulty=difficulty,
+            fight_ids=fight_ids,
+            start_time=start_time,
+            end_time=end_time,
+            ability_id=ability_id,
         )
         for ev in events:
             if ev.get("fight") not in fight_ids:
@@ -209,6 +163,7 @@ def _analyse_report(
         "hits": hits,
         "pulls": pulls,
         "num_wipes": num_wipes,
+        "class_specs": class_specs,
     }
 
 
@@ -256,33 +211,77 @@ def _analyse_one_guild(
     per_value: Dict[str, int] = {}
     per_hits: Dict[str, int] = {}
     per_pulls: Dict[str, int] = {}
+    per_class_spec: Dict[str, Tuple[str, str]] = {}
     guild_total_pulls = 0
 
-    for rep in reports:
-        code = rep.get("code")
-        if not code:
-            continue
-        try:
-            rep_data = _analyse_report(
+    codes = [rep.get("code") for rep in reports if rep.get("code")]
+
+    # The first-kill SCAN above has to be sequential (you can't know where
+    # to stop without checking oldest-to-newest), but once the report list
+    # is fixed, analysing them has no ordering dependency — values/pulls
+    # just get summed. That made the sequential version the actual
+    # wall-clock bottleneck (~1 network round-trip per report, one at a
+    # time — not extra API calls, every report here was getting fetched
+    # regardless of order), so these run concurrently like guilds already do.
+    with ThreadPoolExecutor(max_workers=min(_REPORT_WORKERS, max(1, len(codes)))) as ex:
+        futures = {
+            ex.submit(
+                _analyse_report,
                 code,
                 boss_id=boss_id,
                 ability_id=ability_id,
                 difficulty=difficulty,
                 metric_is_deaths=metric_is_deaths,
                 ignore_after_player_deaths=ignore_after_player_deaths,
-            )
-        except Exception:
-            continue
-        if rep_data is None:
-            continue  # boss not pulled in this report
+            ): code
+            for code in codes
+        }
+        for future in as_completed(futures):
+            code = futures[future]
+            try:
+                rep_data = future.result()
+            except Exception as exc:
+                if is_retryable_error(str(exc)):
+                    # A transient failure (rate limit / network) somewhere in
+                    # this guild's reports means we don't actually know its
+                    # full totals — discard whatever's accumulated so far and
+                    # bail out with a retryable error rather than returning
+                    # partial/undercounted data that looks complete to the
+                    # caller. (Other in-flight reports finish before this
+                    # function returns — the `with` block waits for them —
+                    # but their results are simply discarded.)
+                    result["error"] = f"transient API failure on report {code}: {exc}"
+                    return result
+                continue
+            if rep_data is None:
+                continue  # boss not pulled in this report
 
-        guild_total_pulls += rep_data["num_wipes"]
-        for name, n in rep_data["pulls"].items():
-            per_pulls[name] = per_pulls.get(name, 0) + n
-        for name, v in rep_data["values"].items():
-            per_value[name] = per_value.get(name, 0) + v
-        for name, h in rep_data["hits"].items():
-            per_hits[name] = per_hits.get(name, 0) + h
+            guild_total_pulls += rep_data["num_wipes"]
+            for name, n in rep_data["pulls"].items():
+                per_pulls[name] = per_pulls.get(name, 0) + n
+            for name, v in rep_data["values"].items():
+                per_value[name] = per_value.get(name, 0) + v
+            for name, h in rep_data["hits"].items():
+                per_hits[name] = per_hits.get(name, 0) + h
+            for name, cs in rep_data["class_specs"].items():
+                per_class_spec.setdefault(name, cs)
+
+            if metric_is_deaths:
+                metric_summary = (
+                    f"{sum(rep_data['values'].values())} across "
+                    f"{len(rep_data['values'])} players"
+                )
+            else:
+                metric_summary = (
+                    f"{sum(rep_data['values'].values()):,} "
+                    f"({sum(rep_data['hits'].values())} hits, "
+                    f"{len(rep_data['values'])} players)"
+                )
+            log_line(
+                Guild=_guild_label(guild), Report=code, Boss=boss_id,
+                Wipes=rep_data["num_wipes"],
+                **{"Deaths" if metric_is_deaths else "Damage": metric_summary},
+            )
 
     if guild_total_pulls == 0:
         result["error"] = "boss not pulled in range (or farm-only)"
@@ -297,6 +296,7 @@ def _analyse_one_guild(
             "pulls": per_pulls.get(player, 0),
             "pulls_for_kill": guild_total_pulls,
             "value": int(value),
+            "class_spec": per_class_spec.get(player, ("", "")),
         }
         if not metric_is_deaths:
             row["hits"] = int(per_hits.get(player, 0))
@@ -368,13 +368,15 @@ def aggregate_guilds(
             guild = res["guild"]
             if res["rows"]:
                 merged.extend(res["rows"])
-            else:
-                skipped.append(
-                    {
-                        "guild": guild,
-                        "reason": res["error"] or "no public data for this boss",
-                    }
+                log_line(
+                    Guild=_guild_label(guild),
+                    Result=f"done — {len(res['rows'])} players, "
+                           f"{res.get('guild_total_pulls', 0)} pulls",
                 )
+            else:
+                reason = res["error"] or "no public data for this boss"
+                skipped.append({"guild": guild, "reason": reason})
+                log_line(Guild=_guild_label(guild), Result=f"skipped — {reason}")
 
     total_players = len(merged)
     filtered_low = 0

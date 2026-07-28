@@ -45,7 +45,32 @@ def _target_label(target: dict, raid_file: str) -> str:
     return f"{boss_name} — {ability_id}"
 
 
-def _render_class_colored_table(df_display: pd.DataFrame, *, max_height: int = 480) -> None:
+def _drop_damage_taken_column(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Damage-taken tables always lay out as [Class, Player, <Total Damage
+    Taken label>, Hits, ...per-date columns...] — drop the damage-taken
+    total column, keeping just "Hits (N pulls)", for a more compact
+    on-screen table.
+
+    Presentation-only: this runs on the dataframe right before rendering,
+    so CSV export (built earlier from the original df_display) is unaffected.
+    """
+    cols = list(df.columns)
+    if len(cols) < 4 or cols[3] != "Hits":
+        return df  # not a damage-mode table shape; no-op
+
+    damage_col, hits_col = cols[2], cols[3]
+    suffix = ""
+    if "(" in damage_col:
+        suffix = " " + damage_col[damage_col.index("(") :]
+    hits_label = f"Hits{suffix}"
+
+    out = df.copy()
+    out[hits_label] = out[hits_col]
+    return out[cols[:2] + [hits_label] + cols[4:]]
+
+
+def render_class_colored_table(df_display: pd.DataFrame, *, max_height: int = 480) -> None:
     """
     Render df_display as a sortable HTML table.
 
@@ -62,7 +87,10 @@ def _render_class_colored_table(df_display: pd.DataFrame, *, max_height: int = 4
     """
     df_display = df_display.reset_index(drop=True)
     columns = list(df_display.columns)
-    numeric_cols = {c for c in columns if c not in ("Class", "Player")}
+    # Non-numeric text columns that should sort alphabetically, not as
+    # numbers — "Guild" only appears in the multi-guild table, but listing
+    # it here rather than inferring from content keeps sort-type explicit.
+    numeric_cols = {c for c in columns if c not in ("Class", "Player", "Guild")}
 
     header_html = "".join(
         f'<th data-type="{"num" if c in numeric_cols else "str"}">'
@@ -120,6 +148,10 @@ def _render_class_colored_table(df_display: pd.DataFrame, *, max_height: int = 4
       .wcl-table th, .wcl-table td {{
         box-sizing: border-box;
         vertical-align: middle;
+        border-right: 1px solid rgba(128,128,128,0.25);
+      }}
+      .wcl-table th:last-child, .wcl-table td:last-child {{
+        border-right: none;
       }}
       .wcl-table th {{
         position: sticky;
@@ -146,8 +178,7 @@ def _render_class_colored_table(df_display: pd.DataFrame, *, max_height: int = 4
       .wcl-table td {{
         height: {row_h}px;
         padding: 0 12px;
-        white-space: normal;
-        overflow-wrap: anywhere;
+        white-space: nowrap;
       }}
       .wcl-table tbody tr:nth-child(odd) td {{
         background-color: rgba(128,128,128,0.12);
@@ -248,13 +279,23 @@ def render_results(
     )
 
     # ------------------------------------------------------------------ #
-    # View mode selector
+    # View mode selector — only offer "Boss summary" when some boss
+    # actually has more than one ability with data; summing a single
+    # ability crashes the table (nothing to sum) and isn't useful anyway.
     # ------------------------------------------------------------------ #
-    view_mode = st.radio(
-        "View mode",
-        options=["Single ability view", "Boss summary (sum multiple abilities)"],
-        key=f"{key_prefix}view_mode",
+    can_summarize = any(
+        len([i for i in idxs if i in tables]) > 1
+        for idxs in boss_to_targets.values()
     )
+
+    if can_summarize:
+        view_mode = st.radio(
+            "View mode",
+            options=["Single ability view", "Boss summary (sum multiple abilities)"],
+            key=f"{key_prefix}view_mode",
+        )
+    else:
+        view_mode = "Single ability view"
 
     # ------------------------------------------------------------------ #
     # Single ability view
@@ -301,7 +342,10 @@ def render_results(
             summary_col_count = data.get("summary_col_count", len(df_display.columns))
             df_display = df_display.iloc[:, :summary_col_count]
 
-        _render_class_colored_table(df_display)
+        if not metric_is_deaths:
+            df_display = _drop_damage_taken_column(df_display)
+
+        render_class_colored_table(df_display)
 
         st.download_button(
             "Download CSV",
@@ -429,7 +473,10 @@ def render_results(
         summary_col_count = template.get("summary_col_count", len(df_display.columns))
         render_df = df_display.iloc[:, :summary_col_count]
 
-    _render_class_colored_table(render_df)
+    if not metric_is_deaths:
+        render_df = _drop_damage_taken_column(render_df)
+
+    render_class_colored_table(render_df)
 
     # ------------------------------------------------------------
     # Hyperlinks under the Boss Summary table — skipped in compact mode.

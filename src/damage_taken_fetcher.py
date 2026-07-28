@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 from .api_client import run_wcl_query
-from .deaths_fetcher import get_boss_fights_for_report, _fetch_player_actors
+from .log_utils import log_line
 
 
 def _fetch_damage_taken_events(
@@ -84,6 +84,7 @@ def get_damage_taken_by_player_for_ability(
     difficulty: int | None = 5,
     wipes_only: bool = True,
     ignore_after_player_deaths: int | None = None,
+    guild_name: str | None = None,
 ) -> List[Dict[str, Any]]:
     """
     For a single report, return total damage TAKEN BY PLAYER for a given boss + ability.
@@ -97,47 +98,42 @@ def get_damage_taken_by_player_for_ability(
     The ignore_after_player_deaths parameter is accepted for API parity with
     get_deaths_by_player_for_ability, but at the moment it is not applied to
     the damage window (damage is summed over the full boss fights).
+
+    ``guild_name`` is purely cosmetic — see get_deaths_by_player_for_ability.
     """
 
-    fights = get_boss_fights_for_report(report_code, boss_id, difficulty)
+    # Deferred import: report_cache imports the raw fetchers from this
+    # module, so importing it at module scope here would be circular.
+    from . import report_cache
+
+    fights = report_cache.get_boss_fights(report_code, boss_id, difficulty)
 
     if not fights:
-        print(
-            f"  [damage_taken_fetcher] Report {report_code}: "
-            f"no fights found for boss {boss_id} (difficulty={difficulty})."
-        )
+        log_line(Guild=guild_name, Report=report_code, Boss=boss_id,
+                  Result="no fights for this boss")
         return []
 
     # Optionally keep only wipes (non-kill pulls)
     if wipes_only:
         fights = [f for f in fights if not f.get("kill")]
-        print(
-            f"  [damage_taken_fetcher] Report {report_code}: "
-            f"{len(fights)} wipe fights after wipes_only filter "
-            f"(boss_id={boss_id})."
-        )
         if not fights:
+            log_line(Guild=guild_name, Report=report_code, Boss=boss_id,
+                      Result="no wipe fights (kill-only report)")
             return []
 
     fight_ids = [f["id"] for f in fights]
     start_time = min(f["startTime"] for f in fights)
     end_time = max(f["endTime"] for f in fights)
 
-    damage_events = _fetch_damage_taken_events(
+    damage_events = report_cache.get_damage_events(
         report_code=report_code,
+        boss_id=boss_id,
+        difficulty=difficulty,
+        fight_ids=fight_ids,
         start_time=start_time,
         end_time=end_time,
-        fight_ids=fight_ids,
         ability_id=ability_id,
     )
-
-    print(
-        f"  [damage_taken_fetcher] Report {report_code}: "
-        f"{len(damage_events)} raw damage events in time window "
-        f"(boss_id={boss_id}, ability_id={ability_id})"
-    )
-    if damage_events:
-        print(f"    Sample damage event: {damage_events[0]}")
 
     # If ability_id is None, we include all damage taken in the boss fights.
     filtered: list[dict[str, Any]] = []
@@ -151,17 +147,13 @@ def get_damage_taken_by_player_for_ability(
 
         filtered.append(ev)
 
-    print(
-        f"  [damage_taken_fetcher] Report {report_code}: "
-        f"{len(filtered)} events for ability {ability_id} in boss fights "
-        f"(boss_id={boss_id})"
-    )
-
     if not filtered:
+        log_line(Guild=guild_name, Report=report_code, Boss=boss_id,
+                  Wipes=len(fights), Ability=ability_id, Damage=0, Hits=0)
         return []
 
     # Map actor IDs to player names
-    actors_map = _fetch_player_actors(report_code)
+    actors_map = report_cache.get_report_actors(report_code)
 
     damage_by_player: Dict[str, int] = {}
     hits_by_player: Dict[str, int] = {}
@@ -185,10 +177,10 @@ def get_damage_taken_by_player_for_ability(
 
     total_damage = sum(damage_by_player.values())
     total_hits = sum(hits_by_player.values())
-    print(
-        f"  [damage_taken_fetcher] Report {report_code}: "
-        f"{total_damage} total damage and {total_hits} hits across "
-        f"{len(damage_by_player)} players for ability {ability_id}."
+    log_line(
+        Guild=guild_name, Report=report_code, Boss=boss_id,
+        Wipes=len(fights), Ability=ability_id,
+        Damage=f"{total_damage:,} ({total_hits} hits across {len(damage_by_player)} players)",
     )
 
     rows: List[Dict[str, Any]] = [

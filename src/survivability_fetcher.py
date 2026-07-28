@@ -3,11 +3,7 @@
 from __future__ import annotations
 from typing import Dict
 
-from .deaths_fetcher import (
-    get_boss_fights_for_report,
-    _fetch_death_events,
-    _fetch_player_actors,
-)
+from . import report_cache
 
 
 def compute_survivability_for_report(
@@ -33,12 +29,12 @@ def compute_survivability_for_report(
         }
     """
 
-    fights = get_boss_fights_for_report(report_code, boss_id, difficulty)
+    fights = report_cache.get_boss_fights(report_code, boss_id, difficulty)
     if not fights:
         return {}
 
     # Full actor list for this report: {actor_id: name}
-    actors_id_to_name = _fetch_player_actors(report_code)
+    actors_id_to_name = report_cache.get_report_actors(report_code)
     if not actors_id_to_name:
         return {}
 
@@ -47,15 +43,18 @@ def compute_survivability_for_report(
     start_time = min(f["startTime"] for f in fights)
     end_time = max(f["endTime"] for f in fights)
 
-    # Fetch ALL death events in this window for these fights.
-    # We pass ignore_after_player_deaths=None so that survivability is
-    # ALWAYS based on the true first death timestamp, just like WCL.
-    death_events = _fetch_death_events(
+    # Fetch ALL death events in this window for these fights. wipe_cutoff=None
+    # so survivability is ALWAYS based on the true first death timestamp, just
+    # like WCL — this also means it shares the cached fetch with any deaths
+    # pass that also used no cutoff (ignore_after_player_deaths=0/None).
+    death_events = report_cache.get_death_events(
         report_code=report_code,
+        boss_id=boss_id,
+        difficulty=difficulty,
+        fight_ids=fight_ids,
         start_time=start_time,
         end_time=end_time,
-        fight_ids=fight_ids,
-        ignore_after_player_deaths=None,
+        wipe_cutoff=None,
     )
 
     # Build fight_id -> {player_name -> first_death_timestamp}

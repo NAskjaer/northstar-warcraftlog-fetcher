@@ -16,19 +16,33 @@ from __future__ import annotations
 import math
 from typing import Any, Dict, Optional
 
-# Rough per-guild point cost of one metric×boss pass: a report-list query plus
-# a handful of fights/actors/events queries for the reports that pulled the
-# boss. Deliberately generous so we under-promise on budget.
-POINTS_PER_GUILD = 30
+# Per-guild point cost of one metric×boss pass. Calibrated against a real
+# live run (2026-07-28): a single "First kill" pass for one guild with 19
+# progression report-days cost 155.79 points. The old placeholder (30) was
+# never actually calibrated and underestimated real cost by ~5x. This is
+# still a single flat constant standing in for something that really scales
+# with report-days-in-range (a guild that takes longer to first-kill, or a
+# wider date range, costs more than a guild that clears fast) — rounded up
+# a bit past the one measured data point for margin, but still a rough,
+# guild-shape-dependent estimate, not a guarantee.
+POINTS_PER_GUILD = 160
 
-# Rough wall-clock seconds of network-bound work per guild per pass (sequential
-# report queries dominate). Divided across worker threads for total time.
-SECONDS_PER_GUILD = 3.0
+# Wall-clock seconds of network-bound work per guild per pass. Calibrated
+# from the same live run: that one guild's full sequential analysis (its
+# reports are processed one at a time within a guild, only guilds themselves
+# run concurrently) took 73.63s. Divided across worker threads for total time.
+SECONDS_PER_GUILD = 75.0
 
 # aggregate_guilds() default thread pool size.
 DEFAULT_WORKERS = 4
 
 SECONDS_PER_HOUR = 3600
+
+# Standard per-client hourly points budget, used as a fallback assumption
+# when no live rate-limit reading is available (see plan() below) — it's
+# what warcraftlogs.com issues a normal API client, matching what
+# get_rate_limit() reports for an unthrottled account.
+ASSUMED_LIMIT_PER_HOUR = 3600
 
 
 def estimate_points(num_guilds: int, num_passes: int) -> int:
@@ -55,10 +69,19 @@ def plan(
     """
     Build an estimate dict for a run.
 
-    Always includes ``points`` and ``compute_seconds``. If ``rate_limit`` (as
-    returned by api_client.get_rate_limit) is supplied, also includes budget
-    feasibility and a ``total_seconds`` that accounts for waiting out one or
-    more hourly windows when the run exceeds what's currently available.
+    Always includes ``points`` and ``compute_seconds``, and ``total_seconds``
+    always accounts for waiting out one or more hourly windows when the run
+    needs more points than a single window provides — a run needing 16,000
+    points obviously can't finish in ~32m of compute time alone even in the
+    best case, and the estimate shouldn't quietly omit that wait just
+    because nobody's clicked "Check rate limit" yet.
+
+    If ``rate_limit`` (as returned by api_client.get_rate_limit) is supplied,
+    the wait is computed from the *actual* remaining budget and reset
+    countdown. Without it, this assumes the best case — a completely fresh
+    ASSUMED_LIMIT_PER_HOUR-point window starting right now (``budget_is_
+    assumed`` is True in the result so callers can flag the estimate as
+    provisional) — rather than silently reporting 0 wait.
     """
     points = estimate_points(num_guilds, num_passes)
     compute_s = estimate_compute_seconds(num_guilds, num_passes, workers)
@@ -68,13 +91,17 @@ def plan(
         "points": points,
         "compute_seconds": compute_s,
         "total_seconds": compute_s,
+        "budget_is_assumed": not rate_limit,
     }
-    if not rate_limit:
-        return out
 
-    limit = int(rate_limit.get("limit_per_hour", 0) or 0)
-    spent = float(rate_limit.get("points_spent", 0) or 0)
-    reset_in = int(rate_limit.get("points_reset_in", 0) or 0)
+    if rate_limit:
+        limit = int(rate_limit.get("limit_per_hour", 0) or 0) or ASSUMED_LIMIT_PER_HOUR
+        spent = float(rate_limit.get("points_spent", 0) or 0)
+        reset_in = int(rate_limit.get("points_reset_in", 0) or 0)
+    else:
+        limit = ASSUMED_LIMIT_PER_HOUR
+        spent = 0.0
+        reset_in = SECONDS_PER_HOUR
     remaining = max(0.0, limit - spent)
 
     out.update(
