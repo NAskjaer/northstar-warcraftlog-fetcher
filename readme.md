@@ -1,6 +1,6 @@
 # Northstar Warcraft Logs Analyzer
 
-A lightweight tool that fetches raid reports from Warcraft Logs and generates clean CSV summaries of player deaths and damage taken, grouped by boss/ability and date — for a single guild, or aggregated across many guilds at once.
+A lightweight tool that fetches raid reports from Warcraft Logs and generates clean CSV summaries of player deaths and hits taken, grouped by boss/ability and date — for a single guild, or aggregated across many guilds at once.
 
 The tool runs locally on your machine using Streamlit and includes a built-in .env creator for Warcraft Logs API credentials.
 
@@ -62,7 +62,7 @@ The app will now call warcraftlogs to check if the Secret and Client ID is valid
 
 By default the analyzer targets Midnight Falls with the ability "Heaven's Glaives" pre-selected, "Ignore events after player deaths" set to 3, and "End of range" set to "First kill" (each boss stops at its own first kill instead of a fixed end date) — tuned for the fewest clicks on the current tier. All of these can be changed per run.
 
-Choose **Deaths**, **Damage taken**, or **Both** for what to aggregate.
+Choose **Deaths**, **Hits**, or **Both** for what to aggregate.
 
 #### Guild source: single guild vs. multi-guild queue
 
@@ -79,6 +79,6 @@ The **Warcraft Logs API rate limit** section at the top of the page shows your c
 
 #### Results table
 
-Each results table shows a **Class** column (e.g. "Warrior (Fury)") next to **Player**, colored by the character's WoW class, alongside the metric total and a per-report-day breakdown — **Total Deaths** for deaths tables, or **Hits** for damage-taken tables (the pull count is folded into that column's header; the summary total column shows hit count only, not raw damage — the per-date breakdown and CSV export still include full damage numbers). Click a column header to sort; rows alternate with a faint stripe for readability; neither the header nor the data ever wraps, so columns size to whichever is wider.
+Each results table shows a **Class** column (e.g. "Warrior (Fury)") next to **Player**, colored by the character's WoW class, alongside the metric total and a per-report-day breakdown — **Total Deaths** for deaths tables, or **Hits** for hits tables (the pull count is folded into that column's header; the summary total column shows hit count only, not raw damage — the per-date breakdown and CSV export still include the full **Total Damage** number and per-date damage amounts). Click a column header to sort; rows alternate with a faint stripe for readability; neither the header nor the data ever wraps, so columns size to whichever is wider.
 
-If you select both **Deaths** and **Damage taken**, the two tables show side by side once you switch the page to **Wide mode** (Streamlit's settings menu, top right) — in the default (centered) layout, or with only one metric selected, each table shows full per-date detail; side by side, they're trimmed to just Class / Player / Totals to fit the space (the CSV download always includes the full per-date breakdown regardless).
+If you select both **Deaths** and **Hits**, the two tables show side by side once you switch the page to **Wide mode** (Streamlit's settings menu, top right) — in the default (centered) layout, or with only one metric selected, each table shows full per-date detail; side by side, they're trimmed to just Class / Player / Totals to fit the space (the CSV download always includes the full per-date breakdown regardless).

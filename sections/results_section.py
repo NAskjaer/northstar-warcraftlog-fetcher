@@ -47,10 +47,9 @@ def _target_label(target: dict, raid_file: str) -> str:
 
 def _drop_damage_taken_column(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Damage-taken tables always lay out as [Class, Player, <Total Damage
-    Taken label>, Hits, ...per-date columns...] — drop the damage-taken
-    total column, keeping just "Hits (N pulls)", for a more compact
-    on-screen table.
+    Hits tables always lay out as [Class, Player, <Total Damage label>,
+    Hits, ...per-date columns...] — drop the raw damage total column,
+    keeping just "Hits (N pulls)", for a more compact on-screen table.
 
     Presentation-only: this runs on the dataframe right before rendering,
     so CSV export (built earlier from the original df_display) is unaffected.

@@ -47,6 +47,66 @@ def fetch_all_fights(report_code: str) -> List[Dict[str, Any]]:
         raise RuntimeError(f"Unexpected fights response from WCL: {result}") from exc
 
 
+def fetch_fights_and_actors(report_code: str) -> tuple[List[Dict[str, Any]], Dict[int, str]]:
+    """
+    Fetch fights and player actors together in one round trip.
+
+    Both are independent reads off the same report(code: $code) node — fights
+    doesn't need actor info and actors doesn't need fight info — so combining
+    them (one GraphQL query, two sibling fields) halves the round trips
+    report_cache.get_report_fights/get_report_actors used to cost whichever
+    one is called first (the other becomes a pure cache hit; see
+    report_cache.py). Output shape for each half is identical to
+    fetch_all_fights / _fetch_player_actors.
+    """
+    query = """
+    query ($code: String!) {
+      reportData {
+        report(code: $code) {
+          fights {
+            id
+            name
+            encounterID
+            difficulty
+            kill
+            startTime
+            endTime
+            friendlyPlayers
+          }
+          masterData {
+            actors(type: "Player") {
+              id
+              name
+            }
+          }
+        }
+      }
+    }
+    """
+
+    variables = {"code": report_code}
+    result = run_wcl_query(query, variables)
+
+    try:
+        report = result["data"]["reportData"]["report"]
+        fights = report["fights"]
+        raw_actors = report["masterData"]["actors"]
+    except KeyError as exc:
+        raise RuntimeError(
+            f"Unexpected fights/actors response from WCL: {result}"
+        ) from exc
+
+    id_to_name: Dict[int, str] = {}
+    for actor in raw_actors:
+        actor_id = actor.get("id")
+        name = actor.get("name")
+        if actor_id is None or name is None:
+            continue
+        id_to_name[int(actor_id)] = str(name)
+
+    return fights, id_to_name
+
+
 def get_boss_fights_for_report(
     report_code: str,
     boss_id: int,

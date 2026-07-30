@@ -6,6 +6,10 @@ the overnight runner) so the same report is never queried twice for data
 that doesn't depend on which ability/metric is being analysed.
 
 Cached at the level each underlying WCL query actually varies by:
+  - guild reports    -- per (guild_id, start_ms, end_ms, zone_id). Selecting
+                        both Deaths and Hits runs two full passes over the
+                        same guild(s); without this, each pass independently
+                        re-fetches the identical calendar/report list.
   - fights          -- per report_code only (the query has no boss/difficulty
                         filter; it always returns the whole report).
   - actors          -- per report_code.
@@ -26,13 +30,16 @@ across runs sharing the same process.
 from __future__ import annotations
 
 import threading
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from .deaths_fetcher import fetch_all_fights, _fetch_player_actors, _fetch_death_events
+from .calendar_fetcher import fetch_logs_for_guild
+from .deaths_fetcher import fetch_fights_and_actors, _fetch_death_events
 from .damage_taken_fetcher import _fetch_damage_taken_events
 from .player_details_fetcher import get_player_class_specs
 
 _lock = threading.Lock()
+_reports_cache: Dict[Tuple[int, int, int, Optional[int]], List[Dict[str, Any]]] = {}
 _fights_cache: Dict[str, List[Dict[str, Any]]] = {}
 _actors_cache: Dict[str, Dict[int, str]] = {}
 _class_spec_cache: Dict[Tuple[str, int], Dict[str, Tuple[str, str]]] = {}
@@ -43,6 +50,7 @@ _damage_events_cache: Dict[tuple, List[Dict[str, Any]]] = {}
 def reset_report_caches() -> None:
     """Clear all per-run report caches (call once before an aggregation run)."""
     with _lock:
+        _reports_cache.clear()
         _fights_cache.clear()
         _actors_cache.clear()
         _class_spec_cache.clear()
@@ -62,15 +70,52 @@ def get_stats() -> Dict[str, int]:
         return {"reports_fetched": len(_fights_cache)}
 
 
+def get_guild_reports(
+    guild_id: int, start: datetime, end: datetime, zone_id: Optional[int] = None
+) -> List[Dict[str, Any]]:
+    """
+    A guild's report list for [start, end], memoised per (guild_id, start_ms,
+    end_ms, zone_id).
+
+    Selecting both Deaths and Hits runs a full pass over the guild list
+    twice — without this cache, each pass independently re-fetches the exact
+    same calendar/report list from WCL. Keyed on millisecond-since-epoch
+    (what the underlying query actually sends) rather than the datetime
+    objects themselves, so two separately-constructed but equal timestamps
+    still hit the same cache entry.
+    """
+    s = start if start.tzinfo else start.replace(tzinfo=timezone.utc)
+    e = end if end.tzinfo else end.replace(tzinfo=timezone.utc)
+    key = (guild_id, int(s.timestamp() * 1000), int(e.timestamp() * 1000), zone_id)
+    with _lock:
+        cached = _reports_cache.get(key)
+    if cached is not None:
+        return cached
+    reports = fetch_logs_for_guild(guild_id, s, e, zone_id)
+    with _lock:
+        _reports_cache.setdefault(key, reports)
+        return _reports_cache[key]
+
+
+def _fetch_and_cache_fights_and_actors(report_code: str) -> None:
+    """One combined round trip for fights + actors (see
+    deaths_fetcher.fetch_fights_and_actors) — populates both caches so
+    whichever of get_report_fights/get_report_actors runs first pays for
+    both, and the other is a pure cache hit."""
+    fights, actors = fetch_fights_and_actors(report_code)
+    with _lock:
+        _fights_cache.setdefault(report_code, fights)
+        _actors_cache.setdefault(report_code, actors)
+
+
 def get_report_fights(report_code: str) -> List[Dict[str, Any]]:
     """All fights in a report (every boss, every difficulty), memoised."""
     with _lock:
         cached = _fights_cache.get(report_code)
     if cached is not None:
         return cached
-    fights = fetch_all_fights(report_code)
+    _fetch_and_cache_fights_and_actors(report_code)
     with _lock:
-        _fights_cache.setdefault(report_code, fights)
         return _fights_cache[report_code]
 
 
@@ -88,14 +133,16 @@ def get_boss_fights(
 
 
 def get_report_actors(report_code: str) -> Dict[int, str]:
-    """Player actor id -> name for a report, memoised."""
+    """Player actor id -> name for a report, memoised. Usually already
+    populated by get_report_fights's combined fetch (see
+    _fetch_and_cache_fights_and_actors); only fetches standalone if actors
+    are needed before fights ever were."""
     with _lock:
         cached = _actors_cache.get(report_code)
     if cached is not None:
         return cached
-    actors = _fetch_player_actors(report_code)
+    _fetch_and_cache_fights_and_actors(report_code)
     with _lock:
-        _actors_cache.setdefault(report_code, actors)
         return _actors_cache[report_code]
 
 
@@ -134,17 +181,17 @@ def get_death_events(
     than sharing one unfiltered fetch. ability_id=None (an "all abilities"
     target) still fetches and caches the full unfiltered set.
     """
-    key = (report_code, boss_id, difficulty, wipe_cutoff, ability_id)
+    death_key = (report_code, boss_id, difficulty, wipe_cutoff, ability_id)
     with _lock:
-        cached = _death_events_cache.get(key)
+        cached = _death_events_cache.get(death_key)
     if cached is not None:
         return cached
     events = _fetch_death_events(
         report_code, start_time, end_time, fight_ids, wipe_cutoff, ability_id
     )
     with _lock:
-        _death_events_cache.setdefault(key, events)
-        return _death_events_cache[key]
+        _death_events_cache.setdefault(death_key, events)
+        return _death_events_cache[death_key]
 
 
 def get_damage_events(

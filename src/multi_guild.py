@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .api_client import is_retryable_error
-from .calendar_fetcher import fetch_logs_for_guild, reports_up_to_first_kill
+from .calendar_fetcher import reports_up_to_first_kill
 from .log_utils import log_line
 from . import report_cache
 from .report_cache import reset_report_caches
@@ -42,7 +42,7 @@ def _best_reports_in_range(
     guild_id: int, start_dt, end_dt, zone_id: Optional[int] = None
 ) -> List[Dict[str, Any]]:
     """Reports for the guild in range, keeping the longest report per day."""
-    reports = fetch_logs_for_guild(guild_id, start_dt, end_dt, zone_id)
+    reports = report_cache.get_guild_reports(guild_id, start_dt, end_dt, zone_id)
     if not reports:
         return []
     by_date: Dict[str, List[Dict[str, Any]]] = {}
@@ -65,6 +65,18 @@ def _guild_label(guild: Dict[str, Any]) -> str:
     for "by guild links" entries before their name lookup resolves."""
     name = guild.get("guild_name") or f"Guild {guild.get('guild_id')}"
     return f"{name} ({guild.get('guild_id')})"
+
+
+def class_spec_label(class_spec: Optional[Tuple[str, str]]) -> str:
+    """'Warrior (Fury)' from a (class, spec) pair — shared by every results
+    table (single-guild, live multi-guild, overnight CSVs) so "Class" reads
+    the same everywhere."""
+    cls, spec = class_spec or ("", "")
+    if cls and spec:
+        return f"{cls} ({spec})"
+    if cls:
+        return cls
+    return "Unknown"
 
 
 def _analyse_report(
@@ -273,14 +285,14 @@ def _analyse_one_guild(
                 )
             else:
                 metric_summary = (
-                    f"{sum(rep_data['values'].values()):,} "
-                    f"({sum(rep_data['hits'].values())} hits, "
-                    f"{len(rep_data['values'])} players)"
+                    f"{sum(rep_data['hits'].values())} across "
+                    f"{len(rep_data['values'])} players "
+                    f"({sum(rep_data['values'].values()):,} damage)"
                 )
             log_line(
                 Guild=_guild_label(guild), Report=code, Boss=boss_id,
                 Wipes=rep_data["num_wipes"],
-                **{"Deaths" if metric_is_deaths else "Damage": metric_summary},
+                **{"Deaths" if metric_is_deaths else "Hits": metric_summary},
             )
 
     if guild_total_pulls == 0:
@@ -321,7 +333,7 @@ def aggregate_guilds(
     min_attendance_frac: Optional[float] = 0.8,
     stop_at_first_kill: bool = False,
     max_workers: int = 4,
-    progress_callback: Optional[Callable[[int, int], None]] = None,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, int]]:
     """
     Analyse every guild in parallel (over the date range) and merge all players.
@@ -361,11 +373,11 @@ def aggregate_guilds(
         }
         for future in as_completed(futures):
             completed += 1
-            if progress_callback:
-                progress_callback(completed, total)
-
             res = future.result()
             guild = res["guild"]
+            if progress_callback:
+                progress_callback(completed, total, _guild_label(guild))
+
             if res["rows"]:
                 merged.extend(res["rows"])
                 log_line(

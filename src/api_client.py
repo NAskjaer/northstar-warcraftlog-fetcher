@@ -142,19 +142,25 @@ def is_retryable_error(message: str) -> bool:
     return any(marker in text for marker in _RETRYABLE_ERROR_MARKERS)
 
 
-def get_rate_limit() -> dict:
+def get_rate_limit(max_retries: int = 3, quiet: bool = False) -> dict:
     """
     Return the current Warcraft Logs API points budget:
         {"limit_per_hour": int, "points_spent": float, "points_reset_in": int}
     points_reset_in is seconds until the hourly window resets.
     Raises RuntimeError on failure (including 429).
+
+    ``max_retries``/``quiet`` let a caller that's just polling "has the
+    budget come back yet" (overnight/live runners, while genuinely waiting
+    out an exhaustion) use a fast single attempt with no printed retry
+    chatter, instead of the full 3-attempt backoff dance every poll — the
+    caller already knows to check again shortly either way.
     """
     q = """
     query {
       rateLimitData { limitPerHour pointsSpentThisHour pointsResetIn }
     }
     """
-    data = run_wcl_query(q)["data"]["rateLimitData"]
+    data = run_wcl_query(q, max_retries=max_retries, quiet=quiet)["data"]["rateLimitData"]
     return {
         "limit_per_hour": int(data.get("limitPerHour", 0)),
         "points_spent": float(data.get("pointsSpentThisHour", 0)),
@@ -163,7 +169,8 @@ def get_rate_limit() -> dict:
 
 
 def run_wcl_query(
-    query: str, variables: dict | None = None, max_retries: int = 3
+    query: str, variables: dict | None = None, max_retries: int = 3,
+    quiet: bool = False,
 ) -> dict:
     """
     Run a GraphQL query against the Warcraft Logs v2 client API and return
@@ -177,8 +184,19 @@ def run_wcl_query(
 
     Raises RuntimeError if the API returns GraphQL errors, or if it keeps
     returning 429 or timing out after max_retries.
+
+    ``quiet`` suppresses the per-attempt [RETRY]/[PAUSED]/[FAILED] prints
+    (the retry-status tracker used by the UI's rate-limit indicator still
+    gets updated either way) — for callers that already know a failure here
+    just means "check again later" and don't need the attempt-by-attempt
+    play-by-play repeated on every poll.
     """
     import time as _time
+    from .log_utils import ts_print
+
+    def _emit(msg: str) -> None:
+        if not quiet:
+            ts_print(msg)
 
     headers = {
         "Content-Type": "application/json",
@@ -202,7 +220,7 @@ def run_wcl_query(
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
             if attempt >= max_retries:
                 msg = f"Warcraft Logs API unreachable after {max_retries + 1} attempts — giving up."
-                print(f"  [FAILED] {msg}")
+                _emit(f"  [FAILED] {msg}")
                 _set_retry_status(msg)
                 raise RuntimeError(
                     "Warcraft Logs API kept timing out / failing to connect "
@@ -211,7 +229,7 @@ def run_wcl_query(
             wait = min(2 ** attempt, 5)  # 1, 2, 4, capped 5
             msg = (f"Network hiccup ({type(exc).__name__}) — retrying in {wait}s "
                    f"(attempt {attempt + 1}/{max_retries})...")
-            print(f"  [RETRY] {msg}")
+            _emit(f"  [RETRY] {msg}")
             _set_retry_status(msg)
             _time.sleep(wait)
             continue
@@ -220,7 +238,7 @@ def run_wcl_query(
             if attempt >= max_retries:
                 msg = ("Rate limit (429) did not clear after retries — "
                        "hourly points budget is exhausted.")
-                print(f"  [PAUSED] {msg}")
+                _emit(f"  [PAUSED] {msg}")
                 _set_retry_status(msg)
                 raise RuntimeError(
                     "Warcraft Logs rate limit hit (HTTP 429) and did not clear "
@@ -239,7 +257,7 @@ def run_wcl_query(
                 wait = min(2 ** attempt, 5)  # 1, 2, 4, capped 5
             msg = (f"Rate limited (429) — pausing {wait}s before retry "
                    f"(attempt {attempt + 1}/{max_retries})...")
-            print(f"  [PAUSED] {msg}")
+            _emit(f"  [PAUSED] {msg}")
             _set_retry_status(msg)
             _time.sleep(wait)
             continue
@@ -248,9 +266,9 @@ def run_wcl_query(
         result = resp.json()
 
         if "errors" in result:
-            print("Warcraft Logs API returned errors:")
+            ts_print("Warcraft Logs API returned errors:")
             for err in result["errors"]:
-                print(err)
+                ts_print(str(err))
             raise RuntimeError("Warcraft Logs API error — see messages above.")
 
         _clear_retry_status()

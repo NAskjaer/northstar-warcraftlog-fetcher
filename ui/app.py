@@ -28,7 +28,7 @@ try:
 except Exception:  # pragma: no cover - depends on installed streamlit version
     add_script_run_ctx = None
 
-from src.calendar_fetcher import fetch_logs_for_guild, reports_up_to_first_kill
+from src.calendar_fetcher import reports_up_to_first_kill
 from src.deaths_fetcher import get_deaths_by_player_for_ability
 from src.damage_taken_fetcher import get_damage_taken_by_player_for_ability
 from src.survivability_fetcher import compute_survivability_for_report
@@ -38,8 +38,10 @@ from src.guild_rankings_store import load_ranking
 from src.guild_url import parse_guild_id_from_url
 from src.live_runner import LiveMultiGuildRun
 from src.log_utils import log_line
+from src.multi_guild import class_spec_label
 from src.report_cache import (
     get_boss_fights,
+    get_guild_reports,
     get_report_actors,
     get_report_class_specs,
     get_stats as get_report_cache_stats,
@@ -293,16 +295,16 @@ end_dt = datetime(
     tzinfo=timezone.utc,
 )
 
-# 2.5. Metric selection (Deaths vs Damage Taken)
+# 2.5. Metric selection (Deaths vs Hits)
 metric_mode = st.radio(
     "What do you want to aggregate?",
-    options=["Deaths", "Damage taken", "Both"],
+    options=["Deaths", "Hits", "Both"],
     index=0,
     horizontal=True,   # 👈 makes the radio buttons line up horizontally
 )
 
 show_deaths = metric_mode in ("Deaths", "Both")
-show_damage = metric_mode in ("Damage taken", "Both")
+show_damage = metric_mode in ("Hits", "Both")
 
 # Initialise per-metric results cache
 if "results_cache" not in st.session_state:
@@ -318,13 +320,9 @@ def _ability_label(ability_id, ability_names) -> str:
     return f"{ability_id} ({ability_names.get(ability_id, 'Unknown')})"
 
 
-def _class_spec_label(class_spec) -> str:
-    cls, spec = class_spec or ("", "")
-    if cls and spec:
-        return f"{cls} ({spec})"
-    if cls:
-        return cls
-    return "Unknown"
+# _class_spec_label for the multi-guild table lives in src/multi_guild.py
+# (class_spec_label) so overnight.py's CSV writer can share the exact same
+# formatting without importing this Streamlit-heavy module.
 
 
 def _build_multi_guild_table(rows, metric_is_deaths):
@@ -333,7 +331,7 @@ def _build_multi_guild_table(rows, metric_is_deaths):
         columns = ["Class", "Player", "Guild", "Total Deaths", "Pulls", "Guild Pulls"]
         data = [
             [
-                _class_spec_label(r.get("class_spec")),
+                class_spec_label(r.get("class_spec")),
                 r["player"], r["guild"], r["value"], r["pulls"],
                 r.get("pulls_for_kill", 0),
             ]
@@ -341,12 +339,12 @@ def _build_multi_guild_table(rows, metric_is_deaths):
         ]
     else:
         columns = [
-            "Class", "Player", "Guild", "Total Damage Taken", "Hits", "Pulls",
+            "Class", "Player", "Guild", "Total Damage", "Hits", "Pulls",
             "Guild Pulls",
         ]
         data = [
             [
-                _class_spec_label(r.get("class_spec")),
+                class_spec_label(r.get("class_spec")),
                 r["player"],
                 r["guild"],
                 r["value"],
@@ -590,7 +588,7 @@ def render_multi_guild_cache() -> None:
         return
 
     for i, entry in enumerate(cache["entries"]):
-        metric_text = "Deaths" if entry["metric_is_deaths"] else "Damage taken"
+        metric_text = "Deaths" if entry["metric_is_deaths"] else "Hits"
         st.markdown(
             f"#### {entry['boss_name']} — {entry['ability_label']} · {metric_text}"
         )
@@ -704,7 +702,7 @@ def render_ranking_estimate(num_guilds: int, num_passes: int) -> None:
 
 
 def _launch_overnight(job: dict) -> Path:
-    """Write the job file and spawn overnight_run.py as a detached process."""
+    """Write the job file and spawn overnight_run.py in its own console."""
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     if job.get("guild_input_mode") == "links":
         suffix = f"links{len(job.get('manual_guilds') or [])}"
@@ -718,23 +716,50 @@ def _launch_overnight(job: dict) -> Path:
 
     creationflags = 0
     if os.name == "nt":
-        # Detach so the run survives closing this Streamlit process/tab.
+        # A real, visible console window — a background job with no way to
+        # tell it's running is exactly what we don't want. Detached from
+        # this Streamlit process (CREATE_NEW_PROCESS_GROUP) so it survives
+        # closing the browser tab/app; the window itself is now the "is this
+        # still running" signal, and closing it is a legitimate (if abrupt —
+        # not a clean checkpointed stop) way to kill the run. Output isn't
+        # redirected here — overnight_run.py tees its own stdout/stderr to
+        # both this console and run.log, so both stay populated regardless
+        # of how the script is launched.
         creationflags = (
-            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | 0x00000008
-        )  # 0x08 = DETACHED_PROCESS
-    log_f = open(job_dir / "run.log", "ab")
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
+        )
     subprocess.Popen(
-        # -u: unbuffered stdout/stderr. Without it, print() to a file is
-        # block-buffered and a run that dies mid-flight leaves run.log empty.
+        # -u: unbuffered stdout/stderr, so the console (and run.log, via the
+        # child's own tee) update live instead of batching in blocks.
         [sys.executable, "-u", str(PROJECT_ROOT / "overnight_run.py"),
          "--job", str(job_dir / "job.json")],
         cwd=str(PROJECT_ROOT),
-        stdout=log_f,
-        stderr=log_f,
         creationflags=creationflags,
         close_fds=True,
     )
     return job_dir
+
+
+def _overnight_state_text(status: dict) -> str:
+    """Plain-English state line — 'waiting'/'running' badges alone don't say
+    what's actually happening; the detailed message (time remaining, guild
+    counts, ...) still shows underneath in the caption."""
+    state = status.get("state", "?")
+    if state == "starting":
+        return "Starting…"
+    if state == "waiting":
+        return "Waiting for API Limit Reset"
+    if state == "running":
+        current = status.get("current") or ""
+        return f"Currently processing — {current}" if current else "Running…"
+    if state == "done":
+        return "All Done"
+    if state == "stopped":
+        return "Stopped"
+    if state == "error":
+        return "Error"
+    return state
 
 
 def _render_overnight_status(job_dir: str, status: dict) -> None:
@@ -746,7 +771,7 @@ def _render_overnight_status(job_dir: str, status: dict) -> None:
         "done": "✅", "error": "🔴", "stopped": "⏹️",
     }.get(state, "•")
 
-    st.markdown(f"**State:** {badge} {state} · {status.get('current', '')}")
+    st.markdown(f"**State:** {badge} {_overnight_state_text(status)}")
     st.progress(min(1.0, done / total))
     st.caption(f"{done}/{total} guild-passes · {status.get('message', '')}")
 
@@ -759,6 +784,12 @@ def _render_overnight_status(job_dir: str, status: dict) -> None:
         )
     if status.get("error"):
         st.error(status["error"])
+
+    log_path = Path(job_dir) / "run.log"
+    if log_path.exists():
+        with st.expander("Raw log (run.log)"):
+            tail = log_path.read_text(encoding="utf-8", errors="replace")[-6000:]
+            st.code(tail or "(empty so far)", language=None)
 
     for out in status.get("outputs", []):
         p = Path(out)
@@ -777,12 +808,14 @@ def _render_overnight_status(job_dir: str, status: dict) -> None:
 def render_overnight_launcher(job: dict) -> None:
     with st.expander("🌙 Overnight run (auto-resume through rate limits)"):
         st.caption(
-            "Runs headless in the background. If it runs low on budget mid-range, "
-            "it sleeps straight through to the next hourly reset (WCL tells us "
-            "exactly when that is) rather than polling every few minutes, then "
-            "resumes automatically — so a range too big for one hour just finishes "
-            "overnight. It's a separate process, so it keeps going even if you "
-            "close this browser tab (leave the machine on)."
+            "Opens its own console window with live progress printed to it — "
+            "so it's never a silent background process — and keeps going even "
+            "if you close this browser tab or the Streamlit app (leave the "
+            "machine on). Closing that console window stops the run. If it "
+            "runs low on budget mid-range, it sleeps straight through to the "
+            "next hourly reset (WCL tells us exactly when that is) rather than "
+            "polling every few minutes, then resumes automatically — so a "
+            "range too big for one hour just finishes overnight."
         )
         cols = st.columns([1, 1, 2])
         if cols[0].button("Launch overnight run", key="launch_overnight"):
@@ -799,9 +832,29 @@ def render_overnight_launcher(job: dict) -> None:
             return
         status = overnight.read_status(job_dir)
         if status is None:
-            st.info("Waiting for the run to write its first status…")
+            # No status.json yet — either it just hasn't started up (normal,
+            # takes a couple seconds), or the subprocess died before it got
+            # that far (e.g. an import error). run.log has whatever it
+            # printed either way — the same output the removed console
+            # window would have shown — so surface it directly here instead
+            # of leaving this looking permanently stuck.
+            log_path = Path(job_dir) / "run.log"
+            if log_path.exists():
+                tail = log_path.read_text(encoding="utf-8", errors="replace")[-2000:]
+                if tail.strip():
+                    st.code(tail, language=None)
+            st.info("Waiting for the run to write its first status… (auto-refreshing)")
+            time.sleep(2)
+            st.rerun()
             return
         _render_overnight_status(job_dir, status)
+        # Auto-refresh only through the brief startup window — once it's
+        # confirmed running, this is meant to be left unattended for hours,
+        # so it settles into manual "Refresh status" rather than reloading
+        # the whole page indefinitely.
+        if status.get("state") == "starting":
+            time.sleep(2)
+            st.rerun()
 
 
 if source_mode == "ranking":
@@ -847,6 +900,7 @@ if source_mode == "ranking":
         "end_date": end_date.isoformat(),
         "min_attendance_frac": source_settings.get("min_attendance_frac"),
         "ignore_after_player_deaths": ignore_after_player_deaths,
+        "stop_at_first_kill": stop_at_first_kill,
         "targets": targets,
         "poll_seconds": 300,
     }
@@ -869,7 +923,7 @@ def compute_and_cache_results(
     cache_key: str,
 ) -> None:
     """
-    Fetch logs + compute aggregation for a metric (deaths or damage taken)
+    Fetch logs + compute aggregation for a metric (deaths or hits)
     and store the result in st.session_state["results_cache"][cache_key].
     """
     if not targets:
@@ -886,12 +940,12 @@ def compute_and_cache_results(
         return
 
     overall_start = time.perf_counter()
-    metric_label = "deaths" if metric_is_deaths else "damage taken"
+    metric_label = "deaths" if metric_is_deaths else "hits"
 
     # --- Fetch reports for guild/date range -----------------------------
     with st.spinner(f"Fetching reports from Warcraft Logs for {metric_label}…"):
         try:
-            reports = fetch_logs_for_guild(guild_id, start_dt, end_dt)
+            reports = get_guild_reports(guild_id, start_dt, end_dt)
         except RuntimeError as exc:
             # Usually the hourly points budget (429). Surface it as a message
             # and keep any previously cached results on screen, rather than
@@ -1225,7 +1279,7 @@ def compute_and_cache_results(
         if metric_is_deaths:
             base_total_label = "Total Deaths"
         else:
-            base_total_label = "Total Damage Taken"
+            base_total_label = "Total Damage"
 
         # Optionally append total pull count
         if total_pulls <= 0:
@@ -1343,7 +1397,7 @@ def compute_and_cache_results(
                 "Total Hits": "Hits",
             }
             for date, friendly in zip(date_columns, friendly_date_labels):
-                rename_map[f"{date}__damage"] = f"{friendly} – Damage Taken"
+                rename_map[f"{date}__damage"] = f"{friendly} – Damage"
                 rename_map[f"{date}__hits"] = f"{friendly} – Hits"
 
             df_display = df_display.rename(columns=rename_map)
@@ -1409,7 +1463,7 @@ def compute_and_cache_results(
         boss_to_targets.setdefault(tgt["boss_id"], []).append(idx)
 
     elapsed = time.perf_counter() - overall_start
-    metric_text = "Deaths" if metric_is_deaths else "Damage taken"
+    metric_text = "Deaths" if metric_is_deaths else "Hits"
     st.caption(
         f"{metric_text} aggregation finished in {elapsed:0.1f}s – "
         f"{num_reports} reports, {num_players} players."
@@ -1536,7 +1590,7 @@ if show_deaths and show_damage:
                 metric_is_deaths=False,
                 cache_key="damage",
                 key_prefix="damage_",
-                section_title="### 4. Results — Damage taken",
+                section_title="### 4. Results — Hits",
                 compact=True,
             )
 elif show_deaths:
@@ -1551,5 +1605,5 @@ elif show_damage:
         metric_is_deaths=False,
         cache_key="damage",
         key_prefix="damage_",
-        section_title="### 3. Results — Damage taken",
+        section_title="### 3. Results — Hits",
     )

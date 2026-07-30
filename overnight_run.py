@@ -29,10 +29,64 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from src import boss_config
+from src.log_utils import ts_print
 from src.overnight import run_job
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_RAID = "Midnight_season_1.json"
+
+
+class _Tee:
+    """Duplicate writes to several streams (best-effort — a write that fails
+    on one stream, e.g. a closed console, shouldn't take the others down)."""
+
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, data):
+        for s in self._streams:
+            try:
+                s.write(data)
+            except Exception:
+                pass
+
+    def flush(self):
+        for s in self._streams:
+            try:
+                s.flush()
+            except Exception:
+                pass
+
+
+def _tee_output_to_log(job_dir: Path) -> None:
+    """
+    Mirror everything this process prints to both its own stdout/stderr (a
+    visible console window when launched that way — see ui/app.py's
+    _launch_overnight, which now allocates one instead of hiding it) and
+    job_dir/run.log (so the UI's "Raw log" viewer and post-hoc debugging
+    still work regardless of whether anyone was watching the window live).
+    Opened here (not by the launcher) so this also works correctly when the
+    script is run directly from an existing terminal.
+    """
+    log_f = open(job_dir / "run.log", "a", encoding="utf-8", buffering=1)
+    sys.stdout = _Tee(sys.stdout, log_f)
+    sys.stderr = _Tee(sys.stderr, log_f)
+
+
+def _set_console_title(job: dict, job_dir: Path) -> None:
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        if job.get("guild_input_mode") == "links":
+            scope = f"{len(job.get('manual_guilds') or [])} guilds"
+        else:
+            scope = f"ranks {job.get('rank_start')}-{job.get('rank_end')}"
+        ctypes.windll.kernel32.SetConsoleTitleW(  # type: ignore[attr-defined]
+            f"Overnight run — {scope} — {job_dir.name}"
+        )
+    except Exception:
+        pass
 
 
 def _parse_ranks(text: str) -> tuple[int, int]:
@@ -75,8 +129,9 @@ def _job_from_args(args: argparse.Namespace) -> tuple[dict, Path]:
         "ignore_after_player_deaths": None,
         "targets": targets,
         "poll_seconds": args.poll,
-        "chunk_size": args.chunk_size,
     }
+    if args.chunk_size is not None:
+        job["chunk_size"] = args.chunk_size
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     job_dir = PROJECT_ROOT / "output" / "overnight" / f"{stamp}_r{rank_start}-{rank_end}"
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -91,7 +146,7 @@ def main() -> None:
     p.add_argument("--job", help="Path to a job.json (overrides all other flags).")
     p.add_argument("--ranks", default="1-100", help="Rank range, e.g. 1-300.")
     p.add_argument("--metric", default="both",
-                   choices=["deaths", "damage", "both"])
+                   choices=["deaths", "hits", "damage", "both"])
     p.add_argument("--raid", default=DEFAULT_RAID, help="Raid config filename.")
     p.add_argument("--boss", action="append",
                    help="Limit to this boss (repeatable). Default: all bosses.")
@@ -104,8 +159,12 @@ def main() -> None:
                         "outright (e.g. a hard 429). Once budget is confirmed "
                         "low, the run instead sleeps straight through to WCL's "
                         "own hourly reset countdown, so this rarely matters.")
-    p.add_argument("--chunk-size", dest="chunk_size", type=int, default=20,
-                   help="Guilds analysed between budget checks.")
+    p.add_argument("--chunk-size", dest="chunk_size", type=int, default=None,
+                   help="Cap on guilds analysed per budget-check batch "
+                        "(each batch already takes as many guilds as the "
+                        "current budget affords, up to this cap). Default: "
+                        "derived from estimate.POINTS_PER_GUILD so a batch "
+                        "can never need more than one hourly window.")
     args = p.parse_args()
 
     if args.job:
@@ -115,21 +174,24 @@ def main() -> None:
     else:
         job, job_dir = _job_from_args(args)
 
-    print(f"Overnight run starting. Job dir: {job_dir}")
-    print(f"  ranks {job['rank_start']}-{job['rank_end']}, metric={job['metric']}, "
-          f"{len(job['targets'])} boss/ability target(s)")
-    print("  Watch progress in status.json; create a STOP file in the job dir to stop.")
+    _tee_output_to_log(job_dir)
+    _set_console_title(job, job_dir)
+
+    ts_print(f"Overnight run starting. Job dir: {job_dir}")
+    ts_print(f"  ranks {job['rank_start']}-{job['rank_end']}, metric={job['metric']}, "
+             f"{len(job['targets'])} boss/ability target(s)")
+    ts_print("  Watch progress in status.json; create a STOP file in the job dir to stop.")
 
     final = run_job(job, job_dir)
     state = final.get("state")
     if state == "done":
-        print(f"\nDone. CSVs written to: {job_dir}")
+        ts_print(f"Done. CSVs written to: {job_dir}")
         for o in final.get("outputs", []):
-            print(f"  - {o}")
+            ts_print(f"  - {o}")
     elif state == "stopped":
-        print("\nStopped on request. Re-run the same job dir to resume.")
+        ts_print("Stopped on request. Re-run the same job dir to resume.")
     else:
-        print(f"\nFinished with state={state}. error={final.get('error')}")
+        ts_print(f"Finished with state={state}. error={final.get('error')}")
         sys.exit(1)
 
 

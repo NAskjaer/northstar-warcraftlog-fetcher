@@ -26,12 +26,19 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import report_cache
 from .api_client import get_rate_limit
-from .estimate import POINTS_PER_GUILD
+from .estimate import POINTS_PER_GUILD, ASSUMED_LIMIT_PER_HOUR
 from .log_utils import log_line
 from .multi_guild import aggregate_guilds, reset_report_caches
 
-CHUNK_SIZE = 10
 _BUDGET_MARGIN = 1.15
+# Sanity upper bound on how many guilds go into one batch. The batch size
+# itself is *not* fixed — each iteration fills up to whatever the current
+# remaining budget affords (see _run below), so a run doesn't stop early
+# with points still unspent just because a fixed chunk no longer fits. This
+# cap only bounds worst-case UI/Stop responsiveness within one batch, and is
+# derived (not hardcoded) so a future POINTS_PER_GUILD recalibration can't
+# silently push it out of a sane range.
+MAX_CHUNK = max(1, int(ASSUMED_LIMIT_PER_HOUR / (POINTS_PER_GUILD * _BUDGET_MARGIN)))
 
 
 class LiveMultiGuildRun:
@@ -131,7 +138,8 @@ class LiveMultiGuildRun:
                 return
 
             boss_name = target["boss_name"]
-            metric_label = "deaths" if metric_is_deaths else "damage taken"
+            metric_label = "deaths" if metric_is_deaths else "hits"
+            metric_display = "Deaths" if metric_is_deaths else "Hits"
             todo = list(self._guilds)
             merged: List[Dict[str, Any]] = []
             skipped: List[Dict[str, Any]] = []
@@ -148,8 +156,6 @@ class LiveMultiGuildRun:
                     self._log_run_summary("stopped by user")
                     return
 
-                chunk, todo = todo[:CHUNK_SIZE], todo[CHUNK_SIZE:]
-
                 try:
                     rl = get_rate_limit()
                 except Exception as exc:
@@ -159,21 +165,32 @@ class LiveMultiGuildRun:
                     return
                 self._note_budget(rl)
 
-                need = len(chunk) * POINTS_PER_GUILD * _BUDGET_MARGIN
+                per_guild = POINTS_PER_GUILD * _BUDGET_MARGIN
                 remaining = rl["limit_per_hour"] - rl["points_spent"]
-                if remaining < need:
-                    guilds_left = len(todo) + len(chunk)
+                affordable = int(remaining // per_guild)
+                if affordable < 1:
+                    guilds_left = len(todo)
                     msg = (
                         f"Stopped — only {int(remaining):,} of "
-                        f"{rl['limit_per_hour']:,} pts left, need ~{int(need):,} "
-                        f"for the next {len(chunk)} guilds. {guilds_left} guild(s) "
-                        f"left unprocessed for {boss_name} ({metric_label}) — use "
-                        f"the overnight runner to finish those, or wait for the "
-                        f"hourly reset and re-run."
+                        f"{rl['limit_per_hour']:,} pts left, not enough for even "
+                        f"one more guild (~{int(per_guild):,} needed). "
+                        f"{guilds_left} guild(s) left unprocessed for {boss_name} "
+                        f"({metric_label}) — use the overnight runner to finish "
+                        f"those, or wait for the hourly reset and re-run."
                     )
                     self._update(state="budget_exhausted", budget=rl, message=msg)
                     self._log_run_summary(f"budget exhausted — {msg}")
                     return
+
+                n = min(affordable, len(todo), MAX_CHUNK)
+                chunk, todo = todo[:n], todo[n:]
+
+                def _note_guild_progress(_done, _total, guild_label,
+                                          _boss_name=boss_name,
+                                          _metric_display=metric_display):
+                    self._update(
+                        message=f"Currently processing — {guild_label} — "
+                                f"{_boss_name} — {_metric_display}")
 
                 rows, chunk_skipped, chunk_stats = aggregate_guilds(
                     chunk,
@@ -187,6 +204,7 @@ class LiveMultiGuildRun:
                     ignore_after_player_deaths=self._ignore_after,
                     min_attendance_frac=self._min_attendance_frac,
                     stop_at_first_kill=self._stop_at_first_kill,
+                    progress_callback=_note_guild_progress,
                 )
                 merged.extend(rows)
                 skipped.extend(chunk_skipped)
